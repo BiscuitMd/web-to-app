@@ -4,8 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       target_dir:
-        description: 'Target directory (folder tempat zip disimpan)'
-        required: true
+        description: 'Folder ZIP (kompatibilitas trigger lama)'
+        required: false
+        default: '.'
+        type: string
+      base_zip_path:
+        description: 'Path ZIP yang sudah di-upload ke repository oleh bot'
+        required: false
+        default: ''
+        type: string
+      server:
+        description: 'Nomor server build dari bot'
+        required: false
+        default: ''
+        type: string
+      project_path:
+        description: 'Path project/metadata dari bot'
+        required: false
+        default: '.'
+        type: string
+      user_id:
+        description: 'Telegram user ID (metadata)'
+        required: false
+        default: ''
+        type: string
+      username:
+        description: 'Telegram username (metadata)'
+        required: false
+        default: ''
+        type: string
+      user_name:
+        description: 'Nama user (metadata)'
+        required: false
+        default: ''
         type: string
       zip_file:
         description: 'Nama file zip project'
@@ -56,32 +87,40 @@ jobs:
         id: validate
         run: |
           echo "::group::Validate"
-          TARGET="${{ github.event.inputs.target_dir }}"
-          ZIP="${{ github.event.inputs.zip_file }}"
+          BASE_ZIP="${{ github.event.inputs.base_zip_path }}"
+          TARGET_INPUT="${{ github.event.inputs.target_dir }}"
+          ZIP_INPUT="${{ github.event.inputs.zip_file }}"
 
-          # ═══ CEK FOLDER TARGET ═══
+          # Bot baru mengirim base_zip_path; trigger lama tetap didukung.
+          if [ -n "$BASE_ZIP" ]; then
+            case "$BASE_ZIP" in /*|*..*) echo "::error::base_zip_path tidak valid"; exit 1 ;; esac
+            ZIP_PATH="$BASE_ZIP"
+            TARGET="$(dirname "$ZIP_PATH")"
+            ZIP="$(basename "$ZIP_PATH")"
+          else
+            TARGET="$TARGET_INPUT"
+            ZIP="$ZIP_INPUT"
+            ZIP_PATH="$TARGET/$ZIP"
+          fi
+
           if [ ! -d "$TARGET" ]; then
             echo "::error::Target directory tidak ditemukan: $TARGET"
             exit 1
           fi
-
-          # ═══ CEK FILE ZIP ═══
-          if [ ! -f "$TARGET/$ZIP" ]; then
-            echo "::error::File zip tidak ditemukan: $TARGET/$ZIP"
-            echo "Isi folder $TARGET:"
-            ls -la "$TARGET" || true
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "::error::File ZIP tidak ditemukan: $ZIP_PATH"
+            echo "Isi folder $TARGET:"; ls -la "$TARGET" || true
             exit 1
           fi
 
-          # ═══ LOG INFO ZIP SIZE ═══
-          ZIP_BYTES=$(stat -c%s "$TARGET/$ZIP" 2>/dev/null || stat -f%z "$TARGET/$ZIP")
+          ZIP_BYTES=$(stat -c%s "$ZIP_PATH" 2>/dev/null || stat -f%z "$ZIP_PATH")
           ZIP_MB=$((ZIP_BYTES / 1024 / 1024))
           ZIP_KB=$((ZIP_BYTES / 1024))
           echo "📦 Zip file: $ZIP"
           echo "📦 Zip size: ${ZIP_MB} MB (${ZIP_KB} KB / ${ZIP_BYTES} bytes)"
 
           # ═══ CEK ZIP VALID ═══
-          if ! unzip -t "$TARGET/$ZIP" > /dev/null 2>&1; then
+          if ! unzip -t "$ZIP_PATH" > /dev/null 2>&1; then
             echo "::warning::Zip mungkin corrupt, tapi tetap lanjut coba extract"
           else
             echo "✓ Zip integrity check OK"
@@ -99,6 +138,7 @@ jobs:
 
           echo "target=$TARGET" >> $GITHUB_OUTPUT
           echo "zip=$ZIP" >> $GITHUB_OUTPUT
+          echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
           echo "zip_size_mb=$ZIP_MB" >> $GITHUB_OUTPUT
           echo "✓ Validation OK"
           echo "::endgroup::"
@@ -109,6 +149,7 @@ jobs:
           echo "::group::Extract"
           TARGET="${{ steps.validate.outputs.target }}"
           ZIP="${{ steps.validate.outputs.zip }}"
+          ZIP_PATH="${{ steps.validate.outputs.zip_path }}"
           EXTRACT_DIR="$TARGET/project"
 
           rm -rf "$EXTRACT_DIR"
@@ -117,7 +158,7 @@ jobs:
           echo "⏳ Extracting $ZIP (${{ steps.validate.outputs.zip_size_mb }} MB)..."
           START_TIME=$(date +%s)
 
-          unzip -o "$TARGET/$ZIP" -d "$EXTRACT_DIR"
+          unzip -o "$ZIP_PATH" -d "$EXTRACT_DIR"
 
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
@@ -431,6 +472,12 @@ jobs:
             echo "Job ID: ${{ github.run_id }}"
             echo "Run Number: ${{ github.run_number }}"
             echo "Target Dir: ${{ github.event.inputs.target_dir }}"
+            echo "Base ZIP Path: ${{ github.event.inputs.base_zip_path }}"
+            echo "Server: ${{ github.event.inputs.server }}"
+            echo "Project Path: ${{ github.event.inputs.project_path }}"
+            echo "Telegram User ID: ${{ github.event.inputs.user_id }}"
+            echo "Telegram Username: ${{ github.event.inputs.username }}"
+            echo "Telegram Name: ${{ github.event.inputs.user_name }}"
             echo "Zip File: ${{ github.event.inputs.zip_file }}"
             echo "Zip Size: ${{ steps.validate.outputs.zip_size_mb }} MB"
             echo "Build Type: ${{ github.event.inputs.build_type }}"
