@@ -173,6 +173,62 @@ jobs:
                       print(path.read_text()[:12000])
               raise SystemExit("Could not safely locate the AGP version declaration. Update the project's AGP version to 8.11.1 in its Android Gradle configuration.")
           PYCODE
+      - name: Upgrade Kotlin Gradle Plugin for current Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FLUTTER_PROJECT_DIR"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          candidates = [
+              Path("android/settings.gradle"),
+              Path("android/settings.gradle.kts"),
+              Path("android/build.gradle"),
+              Path("android/build.gradle.kts"),
+          ]
+          changed = []
+          # Modern plugins DSL: org.jetbrains.kotlin.android / kotlin-android.
+          plugin_patterns = [
+              re.compile(r'(id\s*\(?\s*[\'\"]org\.jetbrains\.kotlin\.android[\'\"]\s*\)?\s*version\s*[\'\"])([^\'\"]+)([\'\"])'),
+              re.compile(r'(id\s*\(?\s*[\'\"]kotlin-android[\'\"]\s*\)?\s*version\s*[\'\"])([^\'\"]+)([\'\"])'),
+          ]
+          for path in candidates:
+              if not path.is_file():
+                  continue
+              text = path.read_text()
+              original = text
+              for pattern in plugin_patterns:
+                  text = pattern.sub(lambda m: m.group(1) + "2.2.20" + m.group(3), text)
+              # Legacy ext.kotlin_version = '2.1.0' or kotlin_version = "..."
+              text = re.sub(r'(?m)(\b(?:ext\.)?kotlin_version\s*=\s*[\'\"])[^\'\"]+([\'\"])', r'\g<1>2.2.20\2', text)
+              # Legacy buildscript dependency declaration.
+              text = re.sub(r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9][^\'\"\s]*', r'\g<1>2.2.20', text)
+              if text != original:
+                  path.write_text(text)
+                  changed.append(str(path))
+          catalog = Path("android/gradle/libs.versions.toml")
+          if catalog.is_file():
+              text = catalog.read_text()
+              original = text
+              # Common version-catalog keys for Kotlin Gradle Plugin.
+              text = re.sub(r'(?m)^(\s*kotlin\s*=\s*[\'\"])[^\'\"]+([\'\"])', r'\g<1>2.2.20\2', text)
+              text = re.sub(r'(?m)^(\s*kotlin(?:-android|_android)?\s*=\s*[\'\"])[^\'\"]+([\'\"])', r'\g<1>2.2.20\2', text)
+              if text != original:
+                  catalog.write_text(text)
+                  changed.append(str(catalog))
+          if changed:
+              print("Updated Kotlin Gradle Plugin to 2.2.20 in:")
+              print("\n".join(changed))
+          else:
+              print("No common Kotlin version declaration found; Android Gradle config follows:")
+              for path in candidates + [catalog]:
+                  if path.is_file():
+                      print(f"--- {path} ---")
+                      print(path.read_text()[:12000])
+              raise SystemExit("Could not safely locate Kotlin version declaration; expected minimum 2.2.20.")
+          PYCODE
       - name: Build APK
         shell: bash
         run: |
