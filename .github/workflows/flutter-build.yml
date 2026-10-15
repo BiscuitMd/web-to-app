@@ -98,6 +98,25 @@ jobs:
           ls -la
           flutter --version
           flutter pub get
+      - name: Upgrade Gradle Wrapper for current Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FLUTTER_PROJECT_DIR"
+          wrapper="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$wrapper" ]; then
+            echo "Gradle wrapper properties not found: $wrapper"
+            exit 1
+          fi
+          # Flutter stable 3.47.x requires Gradle 8.14.0 or newer.
+          # Pin to 8.14.3 rather than bypassing Flutter's dependency validation.
+          if grep -q '^distributionUrl=' "$wrapper"; then
+            sed -i -E 's#^distributionUrl=.*#distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$wrapper"
+          else
+            echo 'distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip' >> "$wrapper"
+          fi
+          echo "Updated Gradle Wrapper to 8.14.3"
+          grep '^distributionUrl=' "$wrapper"
       - name: Build APK
         shell: bash
         run: |
