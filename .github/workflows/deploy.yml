@@ -1,0 +1,70 @@
+name: Deploy Website
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: Logical build slot
+        required: true
+        type: choice
+        options: ["1","2","3","4","5"]
+      provider:
+        description: Hosting provider
+        required: true
+        type: choice
+        options: ["vercel","netlify"]
+      project_path:
+        description: Website directory inside repository
+        required: true
+        default: "public"
+      site_name:
+        description: Project/site name
+        required: true
+        type: string
+      user_id:
+        required: false
+        type: string
+      username:
+        required: false
+        type: string
+      user_name:
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: deploy-${{ inputs.server }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Vercel CLI
+        if: inputs.provider == 'vercel'
+        run: npm install --global vercel
+      - name: Deploy to Vercel
+        if: inputs.provider == 'vercel'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SITE_NAME: ${{ inputs.site_name }}
+          PROJECT_PATH: ${{ inputs.project_path }}
+        run: |
+          test -n "$VERCEL_TOKEN"
+          cd "$PROJECT_PATH"
+          vercel deploy --yes --prod --name "$SITE_NAME" --token "$VERCEL_TOKEN"
+      - name: Install Netlify CLI
+        if: inputs.provider == 'netlify'
+        run: npm install --global netlify-cli
+      - name: Deploy to Netlify
+        if: inputs.provider == 'netlify'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
+          SITE_NAME: ${{ inputs.site_name }}
+          PROJECT_PATH: ${{ inputs.project_path }}
+        run: |
+          test -n "$NETLIFY_AUTH_TOKEN"
+          netlify deploy --dir "$PROJECT_PATH" --prod --site "${{ secrets.NETLIFY_SITE_ID }}" --auth "$NETLIFY_AUTH_TOKEN"
