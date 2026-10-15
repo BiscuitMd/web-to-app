@@ -8,7 +8,7 @@ on:
         type: choice
         options: ["1","2","3","4","5"]
       project_path:
-        description: Path to Flutter project in repository
+        description: Optional path to Flutter project in repository (leave . for auto-detect)
         required: true
         default: "."
       build_mode:
@@ -41,19 +41,47 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Resolve project and pubspec
+      - name: Detect Flutter project and normalize pubspec filename
         shell: bash
+        env:
+          REQUESTED_PROJECT_PATH: ${{ inputs.project_path }}
         run: |
           set -euo pipefail
-          cd "${{ inputs.project_path }}"
-          test -f pubspec.yaml || { echo "pubspec.yaml not found"; exit 1; }
+          requested="${REQUESTED_PROJECT_PATH:-.}"
+          if [ ! -d "$requested" ]; then
+            echo "Project path does not exist: $requested"
+            exit 1
+          fi
+          cd "$requested"
+          if [ ! -f pubspec.yaml ] && [ ! -f pubspec.yml ]; then
+            found="$(find . -type f \( -name pubspec.yaml -o -name pubspec.yml \)               -not -path './.git/*' -not -path './build/*' -not -path './.dart_tool/*'               -print -quit)"
+            if [ -z "$found" ]; then
+              echo "No pubspec.yaml or pubspec.yml found under $requested"
+              echo "Top-level files:"; ls -la
+              exit 1
+            fi
+            project_dir="$(dirname "$found")"
+            cd "$project_dir"
+          fi
+          if [ -f pubspec.yml ] && [ ! -f pubspec.yaml ]; then
+            cp pubspec.yml pubspec.yaml
+            echo "Detected pubspec.yml; copied it to pubspec.yaml for Flutter compatibility."
+          fi
+          if [ ! -f pubspec.yaml ]; then
+            echo "pubspec.yaml could not be prepared."
+            exit 1
+          fi
+          resolved="$PWD"
+          echo "FLUTTER_PROJECT_DIR=$resolved" >> "$GITHUB_ENV"
+          echo "Flutter project directory: $resolved"
+          ls -la
           flutter --version
           flutter pub get
       - name: Build APK
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ inputs.project_path }}"
+          cd "$FLUTTER_PROJECT_DIR"
           if [ "${{ inputs.build_mode }}" = "release" ]; then
             flutter build apk --release
           else
@@ -63,7 +91,6 @@ jobs:
         if: always()
         with:
           name: flutter-${{ inputs.build_mode }}-server-${{ inputs.server }}
-          path: |
-            ${{ inputs.project_path }}/build/app/outputs/flutter-apk/*.apk
+          path: ${{ env.FLUTTER_PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: warn
           retention-days: 7
