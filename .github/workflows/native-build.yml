@@ -1,62 +1,513 @@
-name: Native Kotlin Build
+name: Native Build
+
 on:
   workflow_dispatch:
     inputs:
-      server:
-        description: Logical build slot
+      target_dir:
+        description: 'Target directory (folder tempat zip)'
         required: true
+        type: string
+      zip_file:
+        description: 'Nama file zip project'
+        required: false
+        default: 'project.zip'
+        type: string
+      build_task:
+        description: 'Gradle task'
+        required: false
+        default: 'assembleRelease'
         type: choice
-        options: ["1","2","3","4","5"]
-      project_path:
-        description: Android Gradle project path
-        required: true
-        default: "."
-      build_mode:
-        description: Build mode
-        required: true
-        type: choice
-        options: ["release","debug"]
-      user_id:
+        options:
+          - assembleRelease
+          - assembleDebug
+          - bundleRelease
+          - bundleDebug
+      build_flavor:
+        description: 'Product flavor (kosongkan kalau tidak ada)'
         required: false
+        default: ''
         type: string
-      username:
+      java_version:
+        description: 'Versi Java'
         required: false
+        default: '17'
         type: string
-      user_name:
-        required: false
-        type: string
-permissions:
-  contents: read
-concurrency:
-  group: native-${{ inputs.server }}
-  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-      - uses: android-actions/setup-android@v3
-      - name: Validate Gradle project
+          fetch-depth: 1
+
+      - name: Validate Target Directory
+        id: validate
         run: |
-          test -f "${{ inputs.project_path }}/gradlew"
-          chmod +x "${{ inputs.project_path }}/gradlew"
-      - name: Build APK
-        shell: bash
+          echo "::group::Validate"
+          TARGET="${{ github.event.inputs.target_dir }}"
+          ZIP="${{ github.event.inputs.zip_file }}"
+
+          # ═══ CEK FOLDER TARGET ═══
+          if [ ! -d "$TARGET" ]; then
+            echo "::error::Target directory tidak ditemukan: $TARGET"
+            exit 1
+          fi
+
+          # ═══ CEK FILE ZIP ═══
+          if [ ! -f "$TARGET/$ZIP" ]; then
+            echo "::error::File zip tidak ditemukan: $TARGET/$ZIP"
+            ls -la "$TARGET" || true
+            exit 1
+          fi
+
+          # ═══ LOG INFO ZIP SIZE ═══
+          ZIP_BYTES=$(stat -c%s "$TARGET/$ZIP" 2>/dev/null || stat -f%z "$TARGET/$ZIP")
+          ZIP_MB=$((ZIP_BYTES / 1024 / 1024))
+          ZIP_KB=$((ZIP_BYTES / 1024))
+          echo "📦 Zip file: $ZIP"
+          echo "📦 Zip size: ${ZIP_MB} MB (${ZIP_KB} KB / ${ZIP_BYTES} bytes)"
+
+          # ═══ CEK ZIP VALID ═══
+          if ! unzip -t "$TARGET/$ZIP" > /dev/null 2>&1; then
+            echo "::warning::Zip mungkin corrupt, tapi tetap lanjut coba extract"
+          else
+            echo "✓ Zip integrity check OK"
+          fi
+
+          # ═══ CEK DISK SPACE ═══
+          echo "💾 Disk space (before extract):"
+          df -h | head -n 2
+
+          AVAILABLE_MB=$(df -m "$TARGET" | tail -n 1 | awk '{print $4}')
+          echo "💾 Available space: ${AVAILABLE_MB} MB"
+          if [ "$AVAILABLE_MB" -lt 5000 ]; then
+            echo "::warning::Disk space kurang dari 5GB, bisa gagal extract project besar"
+          fi
+
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "zip=$ZIP" >> $GITHUB_OUTPUT
+          echo "zip_size_mb=$ZIP_MB" >> $GITHUB_OUTPUT
+          echo "✓ Validation OK"
+          echo "::endgroup::"
+
+      - name: Extract Project Zip
+        id: extract
         run: |
-          set -euo pipefail
-          cd "${{ inputs.project_path }}"
-          if [ "${{ inputs.build_mode }}" = "release" ]; then ./gradlew assembleRelease --stacktrace; else ./gradlew assembleDebug --stacktrace; fi
-      - uses: actions/upload-artifact@v4
-        if: always()
+          echo "::group::Extract"
+          TARGET="${{ steps.validate.outputs.target }}"
+          ZIP="${{ steps.validate.outputs.zip }}"
+          EXTRACT_DIR="$TARGET/project"
+
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          echo "⏳ Extracting $ZIP (${{ steps.validate.outputs.zip_size_mb }} MB)..."
+          START_TIME=$(date +%s)
+
+          unzip -o "$TARGET/$ZIP" -d "$EXTRACT_DIR"
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "✓ Extract selesai dalam ${DURATION}s"
+
+          # ═══ LOG SIZE SETELAH EXTRACT ═══
+          EXTRACT_SIZE=$(du -sh "$EXTRACT_DIR" 2>/dev/null | awk '{print $1}')
+          echo "📂 Extracted size: ${EXTRACT_SIZE}"
+
+          echo "💾 Disk space (after extract):"
+          df -h | head -n 2
+
+          echo "::group::Extracted Files"
+          ls -la "$EXTRACT_DIR"
+          echo "::endgroup::"
+
+          echo "extract_dir=$EXTRACT_DIR" >> $GITHUB_OUTPUT
+          echo "✓ Extract OK"
+          echo "::endgroup::"
+
+      - name: Detect Gradle Project Root
+        id: detect
+        run: |
+          echo "::group::Detect Project Root"
+          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+
+          ROOT=""
+
+          if [ -f "$EXTRACT_DIR/settings.gradle" ] || [ -f "$EXTRACT_DIR/settings.gradle.kts" ]; then
+            ROOT="$EXTRACT_DIR"
+          elif [ -f "$EXTRACT_DIR/build.gradle" ] || [ -f "$EXTRACT_DIR/build.gradle.kts" ]; then
+            ROOT="$EXTRACT_DIR"
+          elif [ -f "$EXTRACT_DIR/gradlew" ]; then
+            ROOT="$EXTRACT_DIR"
+          else
+            FOUND=$(find "$EXTRACT_DIR" -maxdepth 4 \( \
+              -name "settings.gradle" -o \
+              -name "settings.gradle.kts" -o \
+              -name "gradlew" \
+              \) -type f -not -path "*/node_modules/*" -not -path "*/build/*" | head -n 1)
+
+            if [ -z "$FOUND" ]; then
+              echo "::error::Project Gradle tidak ditemukan"
+              find "$EXTRACT_DIR" -maxdepth 3 -type f | head -n 50
+              exit 1
+            fi
+
+            ROOT=$(dirname "$FOUND")
+          fi
+
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
+          echo "✓ Project root: $ROOT"
+
+          echo "::group::Project Structure"
+          ls -la "$ROOT" | head -n 30
+          echo "::endgroup::"
+          echo "::endgroup::"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
         with:
-          name: native-${{ inputs.build_mode }}-server-${{ inputs.server }}
+          distribution: 'temurin'
+          java-version: ${{ github.event.inputs.java_version }}
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
           path: |
-            ${{ inputs.project_path }}/**/build/outputs/apk/**/*.apk
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties', '**/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Setup Android SDK
+        run: |
+          echo "::group::Setup Android SDK"
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk
+
+          curl -sSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d cmdline-tools-tmp
+          mv cmdline-tools-tmp/cmdline-tools cmdline-tools/latest
+          rm -rf cmdline-tools-tmp cmdline-tools.zip
+
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "✓ Android SDK setup OK"
+          echo "::endgroup::"
+
+      - name: Accept Licenses & Install SDK Packages
+        run: |
+          echo "::group::Install SDK Packages"
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" \
+                     "platforms;android-34" \
+                     "build-tools;34.0.0" \
+                     "platforms;android-33" \
+                     "build-tools;33.0.1" \
+                     "platforms;android-32" \
+                     "build-tools;32.0.0" || true
+          echo "✓ SDK packages installed"
+          echo "::endgroup::"
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.2
+
+      - name: Auto-Generate Missing Icons
+        id: gen_icons
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          echo "::group::Auto-Generate Missing Icons"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+
+          MANIFEST=$(find . -name "AndroidManifest.xml" -path "*/main/*" -type f | head -n 1)
+          if [ -z "$MANIFEST" ]; then
+            echo "::warning::AndroidManifest.xml tidak ditemukan — skip icon generation"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "Manifest: $MANIFEST"
+          RES_DIR=$(dirname "$MANIFEST")/res
+
+          if [ ! -d "$RES_DIR" ]; then
+            echo "::warning::res/ folder tidak ditemukan — skip icon generation"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "Res dir: $RES_DIR"
+
+          ICONS=$(grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" | sed 's|@mipmap/||' | sort -u)
+
+          if [ -z "$ICONS" ]; then
+            echo "::warning::Tidak ada referensi @mipmap/ di manifest"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "Icons yang dibutuhin:"
+          echo "$ICONS"
+
+          for icon in $ICONS; do
+            for density_size in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
+              density=$(echo "$density_size" | cut -d: -f1)
+              size=$(echo "$density_size" | cut -d: -f2)
+              target_dir="$RES_DIR/mipmap-$density"
+              target_file="$target_dir/$icon.png"
+
+              if [ -f "$target_file" ]; then
+                continue
+              fi
+
+              mkdir -p "$target_dir"
+
+              INITIAL=$(echo "$icon" | head -c 1 | tr '[:lower:]' '[:upper:]')
+
+              case "$icon" in
+                *instagram*) COLOR="#E1306C" ;;
+                *youtube*)   COLOR="#FF0000" ;;
+                *whatsapp*)  COLOR="#25D366" ;;
+                *telegram*)  COLOR="#0088CC" ;;
+                *nxxx*)      COLOR="#FF6B9D" ;;
+                *round*)     COLOR="#4A90E2" ;;
+                *launcher*)  COLOR="#10B981" ;;
+                *)           COLOR="#3B82F6" ;;
+              esac
+
+              convert -size ${size}x${size} "xc:$COLOR" \
+                -gravity center \
+                -pointsize $((size / 2)) \
+                -fill white \
+                -font DejaVu-Sans-Bold \
+                -annotate +0+0 "$INITIAL" \
+                "$target_file" 2>/dev/null || \
+              convert -size ${size}x${size} "xc:$COLOR" \
+                -gravity center \
+                -pointsize $((size / 2)) \
+                -fill white \
+                -annotate +0+0 "$INITIAL" \
+                "$target_file"
+
+              echo "✓ Generated: $target_file"
+            done
+          done
+
+          echo "✓ All icons generated"
+          echo "::endgroup::"
+
+      - name: Prepare Gradle Wrapper
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          echo "::group::Prepare Gradle Wrapper"
+          mkdir -p gradle/wrapper
+
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "⚠️ gradle-wrapper.jar missing — generating..."
+            gradle wrapper --gradle-version 8.2 --distribution-type bin
+          fi
+
+          if [ ! -f "gradlew" ]; then
+            echo "⚠️ gradlew missing — generating..."
+            gradle wrapper --gradle-version 8.2 --distribution-type bin
+          fi
+
+          chmod +x gradlew
+          echo "✓ gradlew executable"
+          echo "::endgroup::"
+
+      - name: Fix local.properties
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          echo "::group::Fix local.properties"
+          rm -f local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
+          echo "✓ local.properties OK"
+          echo "::endgroup::"
+
+      - name: Build with Gradle
+        id: gradle_build
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          echo "::group::Gradle Build"
+          TASK="${{ github.event.inputs.build_task }}"
+          FLAVOR="${{ github.event.inputs.build_flavor }}"
+
+          if [ -n "$FLAVOR" ]; then
+            CAP_FLAVOR="$(echo ${FLAVOR:0:1} | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+            FINAL_TASK="${TASK}${CAP_FLAVOR}"
+          else
+            FINAL_TASK="$TASK"
+          fi
+
+          echo "Running: ./gradlew $FINAL_TASK"
+          ./gradlew "$FINAL_TASK" --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "Exit code: $EXIT_CODE"
+          echo "::endgroup::"
+          exit $EXIT_CODE
+
+      - name: Show Gradle Error (Kalau Gagal)
+        if: failure()
+        run: |
+          echo "::group::Gradle Error (Last 100 lines)"
+          if [ -f /tmp/gradle.log ]; then
+            tail -n 100 /tmp/gradle.log
+          fi
+          echo "::endgroup::"
+
+      - name: Locate APK/AAB (RECURSIVE SEARCH)
+        id: locate
+        if: success()
+        run: |
+          ROOT="${{ steps.detect.outputs.root }}"
+          echo "=== Searching in: $ROOT ==="
+          echo ""
+
+          echo "::group::Folder Tree (max 3 level)"
+          find "$ROOT" -maxdepth 3 -type d -not -path "*/\.*" | head -n 40
+          echo "::endgroup::"
+
+          echo "::group::Searching for APK (recursive)"
+          APKS=$(find "$ROOT" -type f -name "*.apk" -not -path "*/\.gradle/*" -not -path "*/\.git/*" 2>/dev/null)
+          if [ -n "$APKS" ]; then
+            echo "✓ APK ditemukan:"
+            echo "$APKS"
+          else
+            echo "✕ Tidak ada APK"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Searching for AAB (recursive)"
+          AABS=$(find "$ROOT" -type f -name "*.aab" -not -path "*/\.gradle/*" -not -path "*/\.git/*" 2>/dev/null)
+          if [ -n "$AABS" ]; then
+            echo "✓ AAB ditemukan:"
+            echo "$AABS"
+          else
+            echo "✕ Tidak ada AAB"
+          fi
+          echo "::endgroup::"
+
+          if [ -z "$APKS" ] && [ -z "$AABS" ]; then
+            echo "::error::Tidak ada APK/AAB yang dihasilkan"
+            echo ""
+            echo "::group::Debug — cari folder build"
+            find "$ROOT" -type d -name "build" 2>/dev/null | head -n 20
+            echo "::endgroup::"
+
+            echo "::group::Debug — cari folder outputs"
+            find "$ROOT" -type d -name "outputs" 2>/dev/null | head -n 20
+            echo "::endgroup::"
+
+            echo "::group::Debug — semua file .apk / .aab"
+            find "$ROOT" -type f \( -name "*.apk" -o -name "*.aab" \) 2>/dev/null
+            echo "::endgroup::"
+
+            echo "::group::Debug — gradle output folder"
+            find "$ROOT" -path "*app/build/outputs*" -type f 2>/dev/null | head -n 30
+            echo "::endgroup::"
+
+            exit 1
+          fi
+
+          {
+            echo "apks<<EOF"
+            echo "$APKS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          {
+            echo "aabs<<EOF"
+            echo "$AABS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "✓ Locate APK/AAB selesai"
+
+      - name: Generate Build Info
+        if: always()
+        run: |
+          echo "::group::Build Info"
+          {
+            echo "=== NATIVE BUILD INFO ==="
+            echo "Job ID: ${{ github.run_id }}"
+            echo "Run Number: ${{ github.run_number }}"
+            echo "Target Dir: ${{ github.event.inputs.target_dir }}"
+            echo "Zip File: ${{ github.event.inputs.zip_file }}"
+            echo "Zip Size: ${{ steps.validate.outputs.zip_size_mb }} MB"
+            echo "Build Task: ${{ github.event.inputs.build_task }}"
+            echo "Build Flavor: ${{ github.event.inputs.build_flavor }}"
+            echo "Java Version: ${{ github.event.inputs.java_version }}"
+            echo "Project Root: ${{ steps.detect.outputs.root }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Actor: ${{ github.actor }}"
+            echo "Finished: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          } > BUILD_INFO.txt
+
+          cat BUILD_INFO.txt
+          echo "::endgroup::"
+
+      - name: Upload APK
+        if: success() && steps.locate.outputs.apks != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: ${{ steps.locate.outputs.apks }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload App Bundle
+        if: success() && steps.locate.outputs.aabs != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbundle-release
+          path: ${{ steps.locate.outputs.aabs }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Build Info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: BUILD_INFO.txt
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Upload Gradle Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log
+          path: /tmp/gradle.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Native Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Job ID | ${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Zip Size | ${{ steps.validate.outputs.zip_size_mb }} MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Task | ${{ github.event.inputs.build_task }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flavor | ${{ github.event.inputs.build_flavor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Java | ${{ github.event.inputs.java_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY 
+                                                   
+web-to-app.yml
