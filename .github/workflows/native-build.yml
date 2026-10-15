@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       target_dir:
-        description: 'Target directory (folder tempat zip)'
+        description: 'Target directory (folder tempat ZIP)'
         required: false
         default: '.'
         type: string
 
-      # Input kompatibilitas untuk trigger dari bot Telegram
+      # Compatibility inputs used by the Telegram bot script
       server:
         description: 'Metadata server dari bot (opsional)'
         required: false
@@ -41,7 +41,7 @@ on:
         type: string
 
       zip_file:
-        description: 'Nama file zip project'
+        description: 'Nama file ZIP project'
         required: false
         default: 'project.zip'
         type: string
@@ -80,71 +80,227 @@ jobs:
         with:
           fetch-depth: 1
 
+      # ============================================================
+      # VALIDATE INPUT + FIND ZIP
+      # FIX: support build-inputs/flutter/*.zip and nested folders
+      # ============================================================
       - name: Validate Target Directory
         id: validate
         shell: bash
+        env:
+          INPUT_TARGET_DIR: ${{ github.event.inputs.target_dir }}
+          INPUT_ZIP_FILE: ${{ github.event.inputs.zip_file }}
+          INPUT_PROJECT_PATH: ${{ github.event.inputs.project_path }}
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          echo "::group::Validate"
+          echo "::group::Validate Project Input"
 
-          TARGET="${{ github.event.inputs.target_dir }}"
-          ZIP="${{ github.event.inputs.zip_file }}"
-          PROJECT_PATH="${{ github.event.inputs.project_path }}"
+          TARGET="${INPUT_TARGET_DIR:-.}"
+          ZIP="${INPUT_ZIP_FILE:-project.zip}"
+          PROJECT_PATH="${INPUT_PROJECT_PATH:-}"
 
-          # project_path dapat menunjuk ke file ZIP atau folder project.
-          if [ -n "$PROJECT_PATH" ]; then
-            if [ -f "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
-              TARGET="$(dirname "$PROJECT_PATH")"
-              ZIP="$(basename "$PROJECT_PATH")"
+          # Normalize empty/default target.
+          [ -n "$TARGET" ] || TARGET="."
 
-            elif [ -d "$PROJECT_PATH" ]; then
-              if [ -f "$PROJECT_PATH/settings.gradle" ] ||
+          # If project_path explicitly points to a ZIP, use that ZIP.
+          if [ -n "$PROJECT_PATH" ] && [ -f "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
+            TARGET="$(dirname "$PROJECT_PATH")"
+            ZIP="$(basename "$PROJECT_PATH")"
+
+          # If project_path is a directory containing a Gradle project,
+          # package it temporarily so the normal extraction pipeline works.
+          elif [ -n "$PROJECT_PATH" ] &&
+               [ -d "$PROJECT_PATH" ] &&
+               [ "$PROJECT_PATH" != "." ] &&
+               {
+                 [ -f "$PROJECT_PATH/settings.gradle" ] ||
                  [ -f "$PROJECT_PATH/settings.gradle.kts" ] ||
-                 [ -f "$PROJECT_PATH/gradlew" ]; then
+                 [ -f "$PROJECT_PATH/gradlew" ] ||
+                 [ -f "$PROJECT_PATH/build.gradle" ] ||
+                 [ -f "$PROJECT_PATH/build.gradle.kts" ];
+               }; then
 
-                mkdir -p "$RUNNER_TEMP/native-input"
+            mkdir -p "$RUNNER_TEMP/native-input"
 
-                (
-                  cd "$PROJECT_PATH"
-                  zip -qr "$RUNNER_TEMP/native-input/project-input.zip" . \
-                    -x '.git/*' 'build/*' '**/build/*'
-                )
+            (
+              cd "$PROJECT_PATH"
+              zip -qr "$RUNNER_TEMP/native-input/project-input.zip" . \
+                -x '.git/*' \
+                   '*/.git/*' \
+                   'build/*' \
+                   '*/build/*' \
+                   '.gradle/*' \
+                   '*/.gradle/*'
+            )
 
-                TARGET="$RUNNER_TEMP/native-input"
-                ZIP="project-input.zip"
-              else
-                TARGET="$PROJECT_PATH"
-              fi
+            TARGET="$RUNNER_TEMP/native-input"
+            ZIP="project-input.zip"
 
-            elif [[ "$PROJECT_PATH" == *.zip ]]; then
-              TARGET="$(dirname "$PROJECT_PATH")"
-              ZIP="$(basename "$PROJECT_PATH")"
+          # A project_path ending in .zip may be supplied by the bot
+          # even if the file does not exist at that exact path.
+          elif [ -n "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
+            PROJECT_DIR="$(dirname "$PROJECT_PATH")"
+            PROJECT_NAME="$(basename "$PROJECT_PATH")"
+
+            if [ -f "$PROJECT_PATH" ]; then
+              TARGET="$PROJECT_DIR"
+              ZIP="$PROJECT_NAME"
+            else
+              echo "::notice::ZIP path from project_path does not exist; searching repository inputs."
             fi
           fi
 
-          [ -n "$TARGET" ] || TARGET="."
+          # If project_path is "." or a non-Gradle directory, do not
+          # replace the default ZIP search with that directory.
+          if [ -n "$PROJECT_PATH" ] &&
+             [ -d "$PROJECT_PATH" ] &&
+             [ "$PROJECT_PATH" != "." ] &&
+             [ "$TARGET" = "$INPUT_TARGET_DIR" ]; then
+            if [ -f "$PROJECT_PATH/settings.gradle" ] ||
+               [ -f "$PROJECT_PATH/settings.gradle.kts" ] ||
+               [ -f "$PROJECT_PATH/gradlew" ] ||
+               [ -f "$PROJECT_PATH/build.gradle" ] ||
+               [ -f "$PROJECT_PATH/build.gradle.kts" ]; then
+              :
+            else
+              echo "::notice::project_path is not a Gradle root; ZIP discovery will continue."
+            fi
+          fi
+
+          # First honor the exact requested path, if present.
+          ZIP_PATH=""
+
+          if [ -f "$TARGET/$ZIP" ]; then
+            ZIP_PATH="$TARGET/$ZIP"
+          elif [ -f "$ZIP" ]; then
+            ZIP_PATH="$ZIP"
+            TARGET="$(dirname "$ZIP_PATH")"
+            [ -n "$TARGET" ] || TARGET="."
+          fi
+
+          # Search common upload locations.
+          # The bot's ZIP may be stored under build-inputs/flutter/
+          # and may have a timestamped filename instead of project.zip.
+          if [ -z "$ZIP_PATH" ]; then
+            SEARCH_DIRS=()
+
+            [ -d "$TARGET" ] && SEARCH_DIRS+=("$TARGET")
+            [ -d "build-inputs" ] && SEARCH_DIRS+=("build-inputs")
+            [ -d "build-inputs/flutter" ] && SEARCH_DIRS+=("build-inputs/flutter")
+
+            # If the default target is ".", the ZIP can still live in
+            # build-inputs/flutter or a deeper subdirectory.
+            for SEARCH_DIR in "${SEARCH_DIRS[@]}"; do
+              if [ -f "$SEARCH_DIR/$ZIP" ]; then
+                ZIP_PATH="$SEARCH_DIR/$ZIP"
+                break
+              fi
+            done
+          fi
+
+          # If the exact filename was not found and the input uses the
+          # default name, select the newest ZIP under build-inputs.
+          if [ -z "$ZIP_PATH" ] &&
+             { [ "$ZIP" = "project.zip" ] || [ -z "$ZIP" ]; }; then
+
+            if [ -d "build-inputs" ]; then
+              ZIP_PATH="$(
+                find "build-inputs" -type f -iname '*.zip' \
+                  -not -path '*/.git/*' \
+                  -printf '%T@ %p\n' 2>/dev/null |
+                sort -nr |
+                head -n 1 |
+                cut -d' ' -f2-
+              )"
+            fi
+
+            if [ -n "$ZIP_PATH" ]; then
+              ZIP="$(basename "$ZIP_PATH")"
+              TARGET="$(dirname "$ZIP_PATH")"
+            fi
+          fi
+
+          # For explicitly named ZIPs, also search recursively for
+          # the same filename under build-inputs.
+          if [ -z "$ZIP_PATH" ] && [ -d "build-inputs" ]; then
+            FOUND_EXACT="$(
+              find "build-inputs" -type f -name "$ZIP" \
+                -not -path '*/.git/*' \
+                -print -quit 2>/dev/null || true
+            )"
+
+            if [ -n "$FOUND_EXACT" ]; then
+              ZIP_PATH="$FOUND_EXACT"
+              TARGET="$(dirname "$ZIP_PATH")"
+            fi
+          fi
+
+          # Final fallback: if a timestamped ZIP exists in build-inputs,
+          # use the newest one rather than failing on project.zip.
+          if [ -z "$ZIP_PATH" ] && [ -d "build-inputs" ]; then
+            ZIP_PATH="$(
+              find "build-inputs" -type f -iname '*.zip' \
+                -not -path '*/.git/*' \
+                -printf '%T@ %p\n' 2>/dev/null |
+              sort -nr |
+              head -n 1 |
+              cut -d' ' -f2-
+            )"
+
+            if [ -n "$ZIP_PATH" ]; then
+              ZIP="$(basename "$ZIP_PATH")"
+              TARGET="$(dirname "$ZIP_PATH")"
+            fi
+          fi
+
+          # If project_path is a generated temporary ZIP, prefer it
+          # only if it actually exists.
+          if [ -z "$ZIP_PATH" ] &&
+             [ -f "$RUNNER_TEMP/native-input/project-input.zip" ]; then
+            ZIP_PATH="$RUNNER_TEMP/native-input/project-input.zip"
+            TARGET="$RUNNER_TEMP/native-input"
+            ZIP="project-input.zip"
+          fi
+
+          if [ -z "$ZIP_PATH" ] || [ ! -f "$ZIP_PATH" ]; then
+            echo "::error::File ZIP project tidak ditemukan."
+            echo "::error::Nama ZIP yang diminta: $ZIP"
+            echo "::error::Target awal: $INPUT_TARGET_DIR"
+            echo "::error::project_path: $PROJECT_PATH"
+            echo ""
+            echo "Repository root:"
+            ls -la .
+            echo ""
+            echo "Isi build-inputs (jika ada):"
+            if [ -d "build-inputs" ]; then
+              find "build-inputs" -maxdepth 5 -type f -print | head -n 200
+            else
+              echo "Folder build-inputs tidak ditemukan."
+            fi
+            exit 1
+          fi
+
+          # Resolve path so later steps can use it consistently.
+          ZIP_PATH="$(realpath "$ZIP_PATH")"
+          TARGET="$(dirname "$ZIP_PATH")"
+          ZIP="$(basename "$ZIP_PATH")"
 
           if [ ! -d "$TARGET" ]; then
             echo "::error::Target directory tidak ditemukan: $TARGET"
             exit 1
           fi
 
-          if [ ! -f "$TARGET/$ZIP" ]; then
-            echo "::error::File ZIP tidak ditemukan: $TARGET/$ZIP"
-            ls -la "$TARGET" || true
-            exit 1
-          fi
-
-          ZIP_BYTES=$(stat -c%s "$TARGET/$ZIP")
+          ZIP_BYTES="$(stat -c%s "$ZIP_PATH")"
           ZIP_MB=$((ZIP_BYTES / 1024 / 1024))
           ZIP_KB=$((ZIP_BYTES / 1024))
 
-          echo "ZIP file: $ZIP"
-          echo "ZIP size: ${ZIP_MB} MB (${ZIP_KB} KB / ${ZIP_BYTES} bytes)"
+          echo "ZIP ditemukan: $ZIP_PATH"
+          echo "Ukuran ZIP: ${ZIP_MB} MB (${ZIP_KB} KB / ${ZIP_BYTES} bytes)"
 
-          if ! unzip -t "$TARGET/$ZIP" >/dev/null 2>&1; then
-            echo "::error::File ZIP tidak valid atau rusak."
+          if ! unzip -t "$ZIP_PATH" >/dev/null 2>&1; then
+            echo "::error::ZIP tidak valid atau rusak: $ZIP_PATH"
+            unzip -t "$ZIP_PATH" || true
             exit 1
           fi
 
@@ -153,60 +309,66 @@ jobs:
           echo "Disk space sebelum extract:"
           df -h | head -n 2
 
-          AVAILABLE_MB=$(df -m "$TARGET" | tail -n 1 | awk '{print $4}')
+          AVAILABLE_MB="$(df -m "$TARGET" | tail -n 1 | awk '{print $4}')"
           echo "Available space: ${AVAILABLE_MB} MB"
 
           if [ "$AVAILABLE_MB" -lt 5000 ]; then
-            echo "::warning::Disk space kurang dari 5GB."
+            echo "::warning::Disk space kurang dari 5GB; build project besar bisa gagal."
           fi
 
+          # Outputs consumed by the existing extraction/build steps.
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
           echo "zip_size_mb=$ZIP_MB" >> "$GITHUB_OUTPUT"
 
-          echo "Validation OK"
+          echo "Validation berhasil."
           echo "::endgroup::"
 
+      # ============================================================
+      # EXTRACT PROJECT
+      # ============================================================
       - name: Extract Project Zip
         id: extract
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          echo "::group::Extract"
-
-          TARGET="${{ steps.validate.outputs.target }}"
-          ZIP="${{ steps.validate.outputs.zip }}"
+          echo "::group::Extract Project"
+          ZIP_PATH="${{ steps.validate.outputs.zip_path }}"
           EXTRACT_DIR="$RUNNER_TEMP/native-project"
 
           rm -rf "$EXTRACT_DIR"
           mkdir -p "$EXTRACT_DIR"
 
-          echo "Extracting $ZIP..."
+          echo "Extracting: $ZIP_PATH"
+          START_TIME="$(date +%s)"
 
-          START_TIME=$(date +%s)
+          unzip -o "$ZIP_PATH" -d "$EXTRACT_DIR"
 
-          unzip -o "$TARGET/$ZIP" -d "$EXTRACT_DIR"
-
-          END_TIME=$(date +%s)
+          END_TIME="$(date +%s)"
           DURATION=$((END_TIME - START_TIME))
 
           echo "Extract selesai dalam ${DURATION}s"
-
-          EXTRACT_SIZE=$(du -sh "$EXTRACT_DIR" 2>/dev/null | awk '{print $1}')
-          echo "Extracted size: $EXTRACT_SIZE"
+          echo "Extracted size: $(du -sh "$EXTRACT_DIR" | awk '{print $1}')"
 
           df -h | head -n 2
 
-          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
-
+          echo "::group::Extracted Files"
+          ls -la "$EXTRACT_DIR"
           echo "::endgroup::"
 
+          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      # ============================================================
+      # DETECT GRADLE PROJECT ROOT
+      # ============================================================
       - name: Detect Gradle Project Root
         id: detect
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
           echo "::group::Detect Project Root"
 
@@ -218,41 +380,61 @@ jobs:
              [ -f "$EXTRACT_DIR/build.gradle" ] ||
              [ -f "$EXTRACT_DIR/build.gradle.kts" ] ||
              [ -f "$EXTRACT_DIR/gradlew" ]; then
-
             ROOT="$EXTRACT_DIR"
           else
-            FOUND=$(find "$EXTRACT_DIR" -maxdepth 5 -type f \
-              \( -name "settings.gradle" \
-              -o -name "settings.gradle.kts" \
-              -o -name "build.gradle" \
-              -o -name "build.gradle.kts" \
-              -o -name "gradlew" \) \
-              -not -path "*/node_modules/*" \
-              -not -path "*/build/*" \
-              | head -n 1)
+            FOUND="$(
+              find "$EXTRACT_DIR" -maxdepth 5 -type f \
+                \( -name "settings.gradle" \
+                -o -name "settings.gradle.kts" \
+                -o -name "gradlew" \
+                -o -name "build.gradle" \
+                -o -name "build.gradle.kts" \) \
+                -not -path "*/node_modules/*" \
+                -not -path "*/build/*" \
+                -print -quit
+            )"
 
             if [ -z "$FOUND" ]; then
-              echo "::error::Project Gradle tidak ditemukan."
-              find "$EXTRACT_DIR" -maxdepth 4 -type f | head -n 80
+              echo "::error::Project Gradle tidak ditemukan di dalam ZIP."
+              find "$EXTRACT_DIR" -maxdepth 4 -type f | head -n 100
               exit 1
             fi
 
             ROOT="$(dirname "$FOUND")"
+
+            # If the found file is a module build.gradle but settings.gradle
+            # exists in its parent, use the parent as the project root.
+            CURRENT="$ROOT"
+            while [ "$CURRENT" != "$EXTRACT_DIR" ] && [ "$CURRENT" != "/" ]; do
+              if [ -f "$CURRENT/settings.gradle" ] ||
+                 [ -f "$CURRENT/settings.gradle.kts" ]; then
+                ROOT="$CURRENT"
+                break
+              fi
+              CURRENT="$(dirname "$CURRENT")"
+            done
           fi
 
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-
           echo "Project root: $ROOT"
-          ls -la "$ROOT" | head -n 40
 
+          echo "::group::Project Structure"
+          ls -la "$ROOT" | head -n 50
+          echo "::endgroup::"
           echo "::endgroup::"
 
+      # ============================================================
+      # JAVA
+      # ============================================================
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ github.event.inputs.java_version || '17' }}
 
+      # ============================================================
+      # GRADLE CACHE
+      # ============================================================
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -263,54 +445,55 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      # ============================================================
+      # ANDROID SDK
+      # ============================================================
       - name: Setup Android SDK
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
           echo "::group::Setup Android SDK"
 
-          SDK="$HOME/android-sdk"
+          SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
 
-          mkdir -p "$SDK/cmdline-tools"
+          cd "$RUNNER_TEMP"
 
-          cd "$SDK"
-
-          curl -fsSL \
+          curl -fLsS \
             "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
-            -o "$RUNNER_TEMP/android-commandline-tools.zip"
+            -o android-commandline-tools.zip
 
-          mkdir -p "$RUNNER_TEMP/android-commandline-tools"
+          mkdir -p "$RUNNER_TEMP/android-cmdline-tools"
+          unzip -q android-commandline-tools.zip \
+            -d "$RUNNER_TEMP/android-cmdline-tools"
 
-          unzip -q "$RUNNER_TEMP/android-commandline-tools.zip" \
-            -d "$RUNNER_TEMP/android-commandline-tools"
+          rm -rf "$SDK_ROOT/cmdline-tools/latest"
+          mv "$RUNNER_TEMP/android-cmdline-tools/cmdline-tools" \
+            "$SDK_ROOT/cmdline-tools/latest"
 
-          rm -rf "$SDK/cmdline-tools/latest"
+          rm -rf "$RUNNER_TEMP/android-cmdline-tools"
+          rm -f android-commandline-tools.zip
 
-          mv "$RUNNER_TEMP/android-commandline-tools/cmdline-tools" \
-            "$SDK/cmdline-tools/latest"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-
+          echo "Android SDK setup OK"
           echo "::endgroup::"
 
-      - name: Accept Licenses and Install SDK Packages
+      - name: Accept Licenses & Install SDK Packages
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          echo "::group::Install Android SDK Packages"
+          echo "::group::Install SDK Packages"
 
-          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
-          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+          sdkmanager \
             "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "platforms;android-33" \
@@ -318,71 +501,90 @@ jobs:
             "platforms;android-32" \
             "build-tools;32.0.0"
 
+          echo "SDK packages installed"
           echo "::endgroup::"
 
+      # ============================================================
+      # GRADLE
+      # ============================================================
       - name: Setup Gradle
         uses: gradle/gradle-build-action@v3
         with:
-          gradle-version: 8.2
+          gradle-version: '8.2'
 
+      # ============================================================
+      # AUTO-GENERATE MISSING ICONS
+      # ============================================================
       - name: Auto-Generate Missing Icons
         id: gen_icons
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
           echo "::group::Auto-Generate Missing Icons"
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick
 
-          MANIFEST=$(find . -path "*/src/main/AndroidManifest.xml" -type f | head -n 1)
+          MANIFEST="$(
+            find . -name "AndroidManifest.xml" \
+              -path "*/main/*" -type f -print -quit
+          )"
 
           if [ -z "$MANIFEST" ]; then
-            echo "::warning::AndroidManifest.xml tidak ditemukan; lewati pembuatan ikon."
+            echo "::warning::AndroidManifest.xml tidak ditemukan; skip icon generation."
             echo "::endgroup::"
             exit 0
           fi
 
+          echo "Manifest: $MANIFEST"
           RES_DIR="$(dirname "$MANIFEST")/res"
 
           if [ ! -d "$RES_DIR" ]; then
-            echo "::warning::Folder res tidak ditemukan; lewati pembuatan ikon."
+            echo "::warning::Folder res/ tidak ditemukan; skip icon generation."
             echo "::endgroup::"
             exit 0
           fi
 
-          ICONS=$(grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" \
-            | sed 's|@mipmap/||' | sort -u || true)
+          ICONS="$(
+            grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" |
+            sed 's|@mipmap/||' |
+            sort -u || true
+          )"
 
           if [ -z "$ICONS" ]; then
-            echo "Tidak ada referensi ikon @mipmap."
+            echo "::warning::Tidak ada referensi @mipmap/ di manifest."
             echo "::endgroup::"
             exit 0
           fi
 
           for icon in $ICONS; do
-            for density_size in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
+            for density_size in \
+              "mdpi:48" \
+              "hdpi:72" \
+              "xhdpi:96" \
+              "xxhdpi:144" \
+              "xxxhdpi:192"; do
+
               density="${density_size%%:*}"
               size="${density_size##*:}"
 
               target_dir="$RES_DIR/mipmap-$density"
               target_file="$target_dir/$icon.png"
 
-              if [ -f "$target_file" ]; then
-                continue
-              fi
+              [ -f "$target_file" ] && continue
 
               mkdir -p "$target_dir"
 
-              INITIAL=$(printf '%s' "$icon" | cut -c1 | tr '[:lower:]' '[:upper:]')
+              INITIAL="$(printf '%s' "$icon" | cut -c1 | tr '[:lower:]' '[:upper:]')"
 
               case "$icon" in
                 *instagram*) COLOR="#E1306C" ;;
                 *youtube*) COLOR="#FF0000" ;;
                 *whatsapp*) COLOR="#25D366" ;;
                 *telegram*) COLOR="#0088CC" ;;
+                *nxxx*) COLOR="#FF6B9D" ;;
                 *round*) COLOR="#4A90E2" ;;
                 *launcher*) COLOR="#10B981" ;;
                 *) COLOR="#3B82F6" ;;
@@ -394,47 +596,64 @@ jobs:
                 -fill white \
                 -font DejaVu-Sans-Bold \
                 -annotate +0+0 "$INITIAL" \
-                "$target_file"
+                "$target_file" 2>/dev/null || {
+                  echo "::warning::Gagal membuat icon otomatis: $target_file"
+                }
 
-              echo "Generated: $target_file"
+              echo "Icon diperiksa: $target_file"
             done
           done
 
           echo "::endgroup::"
 
+      # ============================================================
+      # PREPARE GRADLE WRAPPER
+      # ============================================================
       - name: Prepare Gradle Wrapper
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
           echo "::group::Prepare Gradle Wrapper"
 
-          if [ ! -f "gradlew" ] || [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+          mkdir -p gradle/wrapper
+
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] ||
+             [ ! -f "gradlew" ]; then
+            echo "Gradle wrapper belum lengkap; membuat wrapper Gradle 8.2."
             gradle wrapper --gradle-version 8.2 --distribution-type bin
           fi
 
           chmod +x gradlew
-
+          echo "Gradle wrapper siap."
           echo "::endgroup::"
 
+      # ============================================================
+      # LOCAL PROPERTIES
+      # ============================================================
       - name: Fix local.properties
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          echo "::group::Fix local.properties"
 
-          echo "local.properties:"
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
           cat local.properties
 
+          echo "::endgroup::"
+
+      # ============================================================
+      # BUILD
+      # ============================================================
       - name: Build with Gradle
         id: gradle_build
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
         run: |
-          set -o pipefail
+          set -uo pipefail
 
           echo "::group::Gradle Build"
 
@@ -442,8 +661,7 @@ jobs:
           MODE="${{ github.event.inputs.build_mode }}"
           FLAVOR="${{ github.event.inputs.build_flavor }}"
 
-          # Mode dari bot dipetakan ke task Gradle.
-          # build_mode tetap bertipe string agar trigger tidak terkena HTTP 422.
+          # Preserve compatibility with the Telegram bot's build_mode values.
           case "$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')" in
             debug|assembledebug|apk-debug)
               TASK="assembleDebug"
@@ -465,82 +683,114 @@ jobs:
             assembleRelease|assembleDebug|bundleRelease|bundleDebug)
               ;;
             *)
-              echo "::error::Gradle task tidak didukung: $TASK"
+              echo "::error::Gradle task tidak diizinkan: $TASK"
               exit 1
               ;;
           esac
 
           if [ -n "$FLAVOR" ]; then
-            CAP_FLAVOR="$(printf '%s' "$FLAVOR" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$FLAVOR" | cut -c2-)"
+            CAP_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
             FINAL_TASK="${TASK}${CAP_FLAVOR}"
           else
             FINAL_TASK="$TASK"
           fi
 
-          echo "Build mode: $MODE"
-          echo "Build task: $FINAL_TASK"
-          echo "Build flavor: ${FLAVOR:-none}"
+          echo "Running: ./gradlew $FINAL_TASK"
 
-          ./gradlew "$FINAL_TASK" \
-            --no-daemon \
-            --stacktrace \
-            2>&1 | tee /tmp/gradle.log
+          set +e
+          set -o pipefail
+          ./gradlew "$FINAL_TASK" --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
 
+          echo "Exit code: $EXIT_CODE"
           echo "::endgroup::"
 
+          exit "$EXIT_CODE"
+
+      # ============================================================
+      # GRADLE FAILURE LOG
+      # ============================================================
       - name: Show Gradle Error (Kalau Gagal)
         if: failure()
         shell: bash
         run: |
-          echo "::group::Gradle Error"
+          echo "::group::Gradle Error (Last 100 lines)"
 
           if [ -f /tmp/gradle.log ]; then
-            tail -n 150 /tmp/gradle.log
+            tail -n 100 /tmp/gradle.log
+          else
+            echo "File /tmp/gradle.log belum tersedia."
           fi
 
           echo "::endgroup::"
 
-      - name: Locate APK/AAB
+      # ============================================================
+      # LOCATE APK/AAB
+      # ============================================================
+      - name: Locate APK/AAB (RECURSIVE SEARCH)
         id: locate
         if: success()
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
           ROOT="${{ steps.detect.outputs.root }}"
 
-          echo "Searching artifacts in: $ROOT"
+          echo "Searching in: $ROOT"
 
-          APKS=$(find "$ROOT" -type f -name "*.apk" \
-            -not -path "*/.gradle/*" \
-            -not -path "*/.git/*" \
-            2>/dev/null || true)
+          echo "::group::Folder Tree"
+          find "$ROOT" -maxdepth 3 -type d \
+            -not -path "*/.*" | head -n 50
+          echo "::endgroup::"
 
-          AABS=$(find "$ROOT" -type f -name "*.aab" \
-            -not -path "*/.gradle/*" \
-            -not -path "*/.git/*" \
-            2>/dev/null || true)
-
-          if [ -z "$APKS" ] && [ -z "$AABS" ]; then
-            echo "::error::Tidak ada APK atau AAB yang dihasilkan."
-
-            echo "Folder build:"
-            find "$ROOT" -type d -name build 2>/dev/null | head -n 30 || true
-
-            echo "Folder outputs:"
-            find "$ROOT" -type d -name outputs 2>/dev/null | head -n 30 || true
-
-            exit 1
-          fi
+          echo "::group::Searching for APK"
+          APKS="$(
+            find "$ROOT" -type f -name "*.apk" \
+              -not -path "*/.gradle/*" \
+              -not -path "*/.git/*" 2>/dev/null || true
+          )"
 
           if [ -n "$APKS" ]; then
             echo "APK ditemukan:"
             echo "$APKS"
+          else
+            echo "Tidak ada APK."
           fi
+          echo "::endgroup::"
+
+          echo "::group::Searching for AAB"
+          AABS="$(
+            find "$ROOT" -type f -name "*.aab" \
+              -not -path "*/.gradle/*" \
+              -not -path "*/.git/*" 2>/dev/null || true
+          )"
 
           if [ -n "$AABS" ]; then
             echo "AAB ditemukan:"
             echo "$AABS"
+          else
+            echo "Tidak ada AAB."
+          fi
+          echo "::endgroup::"
+
+          if [ -z "$APKS" ] && [ -z "$AABS" ]; then
+            echo "::error::Tidak ada APK/AAB yang dihasilkan."
+
+            echo "::group::Debug build folders"
+            find "$ROOT" -type d -name "build" 2>/dev/null | head -n 30
+            echo "::endgroup::"
+
+            echo "::group::Debug outputs folders"
+            find "$ROOT" -type d -name "outputs" 2>/dev/null | head -n 30
+            echo "::endgroup::"
+
+            echo "::group::Debug APK/AAB files"
+            find "$ROOT" -type f \
+              \( -name "*.apk" -o -name "*.aab" \) 2>/dev/null
+            echo "::endgroup::"
+
+            exit 1
           fi
 
           {
@@ -555,6 +805,11 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+          echo "Locate APK/AAB selesai."
+
+      # ============================================================
+      # BUILD INFO
+      # ============================================================
       - name: Generate Build Info
         if: always()
         shell: bash
@@ -569,40 +824,48 @@ jobs:
             echo "User ID: ${{ github.event.inputs.user_id }}"
             echo "Username: ${{ github.event.inputs.username }}"
             echo "User Name: ${{ github.event.inputs.user_name }}"
-            echo "ZIP File: ${{ steps.validate.outputs.zip }}"
-            echo "ZIP Size: ${{ steps.validate.outputs.zip_size_mb }} MB"
-            echo "Build Task: ${{ github.event.inputs.build_task }}"
+            echo "Requested Zip: ${{ github.event.inputs.zip_file }}"
+            echo "Resolved Zip: ${{ steps.validate.outputs.zip }}"
+            echo "Zip Size: ${{ steps.validate.outputs.zip_size_mb }} MB"
             echo "Build Mode: ${{ github.event.inputs.build_mode }}"
+            echo "Build Task: ${{ github.event.inputs.build_task }}"
             echo "Build Flavor: ${{ github.event.inputs.build_flavor }}"
             echo "Java Version: ${{ github.event.inputs.java_version }}"
             echo "Project Root: ${{ steps.detect.outputs.root }}"
             echo "Commit: ${{ github.sha }}"
             echo "Actor: ${{ github.actor }}"
-            echo "Finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Finished: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           } > BUILD_INFO.txt
 
           cat BUILD_INFO.txt
 
+      # ============================================================
+      # UPLOAD APK
+      # ============================================================
       - name: Upload APK
         if: success() && steps.locate.outputs.apks != ''
         uses: actions/upload-artifact@v4
         with:
           name: apk-release
-          path: |
-            ${{ steps.locate.outputs.apks }}
+          path: ${{ steps.locate.outputs.apks }}
           if-no-files-found: error
           retention-days: 7
 
+      # ============================================================
+      # UPLOAD APP BUNDLE
+      # ============================================================
       - name: Upload App Bundle
         if: success() && steps.locate.outputs.aabs != ''
         uses: actions/upload-artifact@v4
         with:
           name: appbundle-release
-          path: |
-            ${{ steps.locate.outputs.aabs }}
+          path: ${{ steps.locate.outputs.aabs }}
           if-no-files-found: error
           retention-days: 7
 
+      # ============================================================
+      # UPLOAD BUILD INFO
+      # ============================================================
       - name: Upload Build Info
         if: always()
         uses: actions/upload-artifact@v4
@@ -612,6 +875,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # ============================================================
+      # UPLOAD GRADLE LOG
+      # ============================================================
       - name: Upload Gradle Log
         if: always()
         uses: actions/upload-artifact@v4
@@ -621,6 +887,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # ============================================================
+      # SUMMARY
+      # ============================================================
       - name: Summary
         if: always()
         shell: bash
@@ -629,11 +898,13 @@ jobs:
             echo "## Native Build Summary"
             echo ""
             echo "| Field | Value |"
-            echo "|---|---|"
+            echo "|-------|-------|"
             echo "| Job ID | ${{ github.run_id }} |"
+            echo "| Requested ZIP | ${{ github.event.inputs.zip_file }} |"
+            echo "| Resolved ZIP | ${{ steps.validate.outputs.zip }} |"
             echo "| ZIP Size | ${{ steps.validate.outputs.zip_size_mb }} MB |"
-            echo "| Build Task | ${{ github.event.inputs.build_task }} |"
             echo "| Build Mode | ${{ github.event.inputs.build_mode }} |"
+            echo "| Build Task | ${{ github.event.inputs.build_task }} |"
             echo "| Flavor | ${{ github.event.inputs.build_flavor }} |"
             echo "| Java | ${{ github.event.inputs.java_version }} |"
             echo "| Status | ${{ job.status }} |"
