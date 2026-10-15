@@ -82,7 +82,6 @@ jobs:
 
       # ============================================================
       # VALIDATE INPUT + FIND ZIP
-      # FIX: support build-inputs/flutter/*.zip and nested folders
       # ============================================================
       - name: Validate Target Directory
         id: validate
@@ -100,16 +99,17 @@ jobs:
           ZIP="${INPUT_ZIP_FILE:-project.zip}"
           PROJECT_PATH="${INPUT_PROJECT_PATH:-}"
 
-          # Normalize empty/default target.
           [ -n "$TARGET" ] || TARGET="."
 
-          # If project_path explicitly points to a ZIP, use that ZIP.
-          if [ -n "$PROJECT_PATH" ] && [ -f "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
+          # Explicit project_path pointing to a ZIP.
+          if [ -n "$PROJECT_PATH" ] &&
+             [ -f "$PROJECT_PATH" ] &&
+             [[ "$PROJECT_PATH" == *.zip ]]; then
+
             TARGET="$(dirname "$PROJECT_PATH")"
             ZIP="$(basename "$PROJECT_PATH")"
 
-          # If project_path is a directory containing a Gradle project,
-          # package it temporarily so the normal extraction pipeline works.
+          # Package a supplied Gradle project directory temporarily.
           elif [ -n "$PROJECT_PATH" ] &&
                [ -d "$PROJECT_PATH" ] &&
                [ "$PROJECT_PATH" != "." ] &&
@@ -137,8 +137,7 @@ jobs:
             TARGET="$RUNNER_TEMP/native-input"
             ZIP="project-input.zip"
 
-          # A project_path ending in .zip may be supplied by the bot
-          # even if the file does not exist at that exact path.
+          # A project_path ZIP may not exist at the specified location.
           elif [ -n "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
             PROJECT_DIR="$(dirname "$PROJECT_PATH")"
             PROJECT_NAME="$(basename "$PROJECT_PATH")"
@@ -151,12 +150,12 @@ jobs:
             fi
           fi
 
-          # If project_path is "." or a non-Gradle directory, do not
-          # replace the default ZIP search with that directory.
+          # Do not treat a non-Gradle directory as the project root.
           if [ -n "$PROJECT_PATH" ] &&
              [ -d "$PROJECT_PATH" ] &&
              [ "$PROJECT_PATH" != "." ] &&
-             [ "$TARGET" = "$INPUT_TARGET_DIR" ]; then
+             [ "$TARGET" = "${INPUT_TARGET_DIR:-.}" ]; then
+
             if [ -f "$PROJECT_PATH/settings.gradle" ] ||
                [ -f "$PROJECT_PATH/settings.gradle.kts" ] ||
                [ -f "$PROJECT_PATH/gradlew" ] ||
@@ -168,9 +167,9 @@ jobs:
             fi
           fi
 
-          # First honor the exact requested path, if present.
           ZIP_PATH=""
 
+          # First honor the exact requested path.
           if [ -f "$TARGET/$ZIP" ]; then
             ZIP_PATH="$TARGET/$ZIP"
           elif [ -f "$ZIP" ]; then
@@ -180,8 +179,6 @@ jobs:
           fi
 
           # Search common upload locations.
-          # The bot's ZIP may be stored under build-inputs/flutter/
-          # and may have a timestamped filename instead of project.zip.
           if [ -z "$ZIP_PATH" ]; then
             SEARCH_DIRS=()
 
@@ -189,8 +186,6 @@ jobs:
             [ -d "build-inputs" ] && SEARCH_DIRS+=("build-inputs")
             [ -d "build-inputs/flutter" ] && SEARCH_DIRS+=("build-inputs/flutter")
 
-            # If the default target is ".", the ZIP can still live in
-            # build-inputs/flutter or a deeper subdirectory.
             for SEARCH_DIR in "${SEARCH_DIRS[@]}"; do
               if [ -f "$SEARCH_DIR/$ZIP" ]; then
                 ZIP_PATH="$SEARCH_DIR/$ZIP"
@@ -199,8 +194,8 @@ jobs:
             done
           fi
 
-          # If the exact filename was not found and the input uses the
-          # default name, select the newest ZIP under build-inputs.
+          # If the default name was not found, select the newest ZIP
+          # under build-inputs, including nested folders.
           if [ -z "$ZIP_PATH" ] &&
              { [ "$ZIP" = "project.zip" ] || [ -z "$ZIP" ]; }; then
 
@@ -221,8 +216,7 @@ jobs:
             fi
           fi
 
-          # For explicitly named ZIPs, also search recursively for
-          # the same filename under build-inputs.
+          # Search recursively for an explicitly named ZIP.
           if [ -z "$ZIP_PATH" ] && [ -d "build-inputs" ]; then
             FOUND_EXACT="$(
               find "build-inputs" -type f -name "$ZIP" \
@@ -236,8 +230,7 @@ jobs:
             fi
           fi
 
-          # Final fallback: if a timestamped ZIP exists in build-inputs,
-          # use the newest one rather than failing on project.zip.
+          # Final fallback: newest ZIP in build-inputs.
           if [ -z "$ZIP_PATH" ] && [ -d "build-inputs" ]; then
             ZIP_PATH="$(
               find "build-inputs" -type f -iname '*.zip' \
@@ -254,8 +247,7 @@ jobs:
             fi
           fi
 
-          # If project_path is a generated temporary ZIP, prefer it
-          # only if it actually exists.
+          # Use the generated temporary ZIP when applicable.
           if [ -z "$ZIP_PATH" ] &&
              [ -f "$RUNNER_TEMP/native-input/project-input.zip" ]; then
             ZIP_PATH="$RUNNER_TEMP/native-input/project-input.zip"
@@ -273,15 +265,16 @@ jobs:
             ls -la .
             echo ""
             echo "Isi build-inputs (jika ada):"
+
             if [ -d "build-inputs" ]; then
               find "build-inputs" -maxdepth 5 -type f -print | head -n 200
             else
               echo "Folder build-inputs tidak ditemukan."
             fi
+
             exit 1
           fi
 
-          # Resolve path so later steps can use it consistently.
           ZIP_PATH="$(realpath "$ZIP_PATH")"
           TARGET="$(dirname "$ZIP_PATH")"
           ZIP="$(basename "$ZIP_PATH")"
@@ -305,7 +298,6 @@ jobs:
           fi
 
           echo "ZIP integrity check OK"
-
           echo "Disk space sebelum extract:"
           df -h | head -n 2
 
@@ -316,7 +308,6 @@ jobs:
             echo "::warning::Disk space kurang dari 5GB; build project besar bisa gagal."
           fi
 
-          # Outputs consumed by the existing extraction/build steps.
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
@@ -335,6 +326,7 @@ jobs:
           set -Eeuo pipefail
 
           echo "::group::Extract Project"
+
           ZIP_PATH="${{ steps.validate.outputs.zip_path }}"
           EXTRACT_DIR="$RUNNER_TEMP/native-project"
 
@@ -380,6 +372,7 @@ jobs:
              [ -f "$EXTRACT_DIR/build.gradle" ] ||
              [ -f "$EXTRACT_DIR/build.gradle.kts" ] ||
              [ -f "$EXTRACT_DIR/gradlew" ]; then
+
             ROOT="$EXTRACT_DIR"
           else
             FOUND="$(
@@ -402,8 +395,6 @@ jobs:
 
             ROOT="$(dirname "$FOUND")"
 
-            # If the found file is a module build.gradle but settings.gradle
-            # exists in its parent, use the parent as the project root.
             CURRENT="$ROOT"
             while [ "$CURRENT" != "$EXTRACT_DIR" ] && [ "$CURRENT" != "/" ]; do
               if [ -f "$CURRENT/settings.gradle" ] ||
@@ -422,6 +413,58 @@ jobs:
           ls -la "$ROOT" | head -n 50
           echo "::endgroup::"
           echo "::endgroup::"
+
+      # ============================================================
+      # DETECT FLUTTER PROJECT ROOT
+      # ============================================================
+      - name: Detect Flutter Project Root
+        id: flutter_detect
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+          GRADLE_ROOT="${{ steps.detect.outputs.root }}"
+          FLUTTER_ROOT=""
+
+          # A Flutter Android project normally has pubspec.yaml above
+          # its android/ directory.
+          CURRENT="$GRADLE_ROOT"
+
+          while [ "$CURRENT" != "/" ]; do
+            if [ -f "$CURRENT/pubspec.yaml" ]; then
+              FLUTTER_ROOT="$CURRENT"
+              break
+            fi
+
+            CURRENT="$(dirname "$CURRENT")"
+          done
+
+          # Fallback for ZIPs containing nested Flutter projects.
+          if [ -z "$FLUTTER_ROOT" ]; then
+            FOUND="$(
+              find "$EXTRACT_DIR" -maxdepth 7 \
+                -type f -name "pubspec.yaml" \
+                -not -path "*/.gradle/*" \
+                -not -path "*/build/*" \
+                -not -path "*/node_modules/*" \
+                -print -quit
+            )"
+
+            if [ -n "$FOUND" ]; then
+              FLUTTER_ROOT="$(dirname "$FOUND")"
+            fi
+          fi
+
+          if [ -n "$FLUTTER_ROOT" ]; then
+            echo "is_flutter=true" >> "$GITHUB_OUTPUT"
+            echo "flutter_root=$FLUTTER_ROOT" >> "$GITHUB_OUTPUT"
+            echo "Flutter project ditemukan: $FLUTTER_ROOT"
+          else
+            echo "is_flutter=false" >> "$GITHUB_OUTPUT"
+            echo "flutter_root=" >> "$GITHUB_OUTPUT"
+            echo "Project Flutter tidak ditemukan; lanjut sebagai Gradle biasa."
+          fi
 
       # ============================================================
       # JAVA
@@ -465,10 +508,12 @@ jobs:
             -o android-commandline-tools.zip
 
           mkdir -p "$RUNNER_TEMP/android-cmdline-tools"
+
           unzip -q android-commandline-tools.zip \
             -d "$RUNNER_TEMP/android-cmdline-tools"
 
           rm -rf "$SDK_ROOT/cmdline-tools/latest"
+
           mv "$RUNNER_TEMP/android-cmdline-tools/cmdline-tools" \
             "$SDK_ROOT/cmdline-tools/latest"
 
@@ -502,6 +547,28 @@ jobs:
             "build-tools;32.0.0"
 
           echo "SDK packages installed"
+          echo "::endgroup::"
+
+      # ============================================================
+      # FLUTTER SDK — ONLY FOR FLUTTER PROJECTS
+      # ============================================================
+      - name: Setup Flutter
+        if: steps.flutter_detect.outputs.is_flutter == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter Pub Get
+        if: steps.flutter_detect.outputs.is_flutter == 'true'
+        working-directory: ${{ steps.flutter_detect.outputs.flutter_root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "::group::Flutter Dependencies"
+          flutter --version
+          flutter pub get
           echo "::endgroup::"
 
       # ============================================================
@@ -630,18 +697,55 @@ jobs:
           echo "::endgroup::"
 
       # ============================================================
-      # LOCAL PROPERTIES
+      # LOCAL PROPERTIES — FIX FLUTTER.SDK
       # ============================================================
       - name: Fix local.properties
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
+        env:
+          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
+          FLUTTER_PROJECT_ROOT: ${{ steps.flutter_detect.outputs.flutter_root }}
         run: |
           set -Eeuo pipefail
 
           echo "::group::Fix local.properties"
 
-          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
-          cat local.properties
+          PROPERTIES_FILE="local.properties"
+          TEMP_FILE="$(mktemp)"
+
+          # Preserve other existing properties.
+          if [ -f "$PROPERTIES_FILE" ]; then
+            grep -vE '^(sdk\.dir|flutter\.sdk)=' \
+              "$PROPERTIES_FILE" > "$TEMP_FILE" || true
+          fi
+
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" >> "$TEMP_FILE"
+
+          if [ "$IS_FLUTTER" = "true" ]; then
+            if ! command -v flutter >/dev/null 2>&1; then
+              echo "::error::Flutter SDK belum tersedia."
+              rm -f "$TEMP_FILE"
+              exit 1
+            fi
+
+            FLUTTER_BIN="$(readlink -f "$(command -v flutter)")"
+            FLUTTER_SDK_ROOT="$(dirname "$(dirname "$FLUTTER_BIN")")"
+
+            if [ ! -d "$FLUTTER_SDK_ROOT/packages/flutter_tools" ]; then
+              echo "::error::Lokasi Flutter SDK tidak valid: $FLUTTER_SDK_ROOT"
+              rm -f "$TEMP_FILE"
+              exit 1
+            fi
+
+            printf 'flutter.sdk=%s\n' "$FLUTTER_SDK_ROOT" >> "$TEMP_FILE"
+            echo "Flutter project root: $FLUTTER_PROJECT_ROOT"
+            echo "Flutter SDK root: $FLUTTER_SDK_ROOT"
+          fi
+
+          mv "$TEMP_FILE" "$PROPERTIES_FILE"
+
+          echo "Isi local.properties:"
+          cat "$PROPERTIES_FILE"
 
           echo "::endgroup::"
 
@@ -661,7 +765,7 @@ jobs:
           MODE="${{ github.event.inputs.build_mode }}"
           FLAVOR="${{ github.event.inputs.build_flavor }}"
 
-          # Preserve compatibility with the Telegram bot's build_mode values.
+          # Preserve compatibility with Telegram bot build_mode values.
           case "$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')" in
             debug|assembledebug|apk-debug)
               TASK="assembleDebug"
@@ -832,6 +936,8 @@ jobs:
             echo "Build Flavor: ${{ github.event.inputs.build_flavor }}"
             echo "Java Version: ${{ github.event.inputs.java_version }}"
             echo "Project Root: ${{ steps.detect.outputs.root }}"
+            echo "Flutter Project: ${{ steps.flutter_detect.outputs.is_flutter }}"
+            echo "Flutter Root: ${{ steps.flutter_detect.outputs.flutter_root }}"
             echo "Commit: ${{ github.sha }}"
             echo "Actor: ${{ github.actor }}"
             echo "Finished: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -907,5 +1013,6 @@ jobs:
             echo "| Build Task | ${{ github.event.inputs.build_task }} |"
             echo "| Flavor | ${{ github.event.inputs.build_flavor }} |"
             echo "| Java | ${{ github.event.inputs.java_version }} |"
+            echo "| Flutter Project | ${{ steps.flutter_detect.outputs.is_flutter }} |"
             echo "| Status | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
