@@ -10,14 +10,15 @@ on:
         type: string
         default: "github"
       build_mode:
-        description: "Build mode"
+        description: "Build mode: debug, release, bundle"
         required: false
         type: string
-        default: "debug"
+        default: "release"
       project_path:
-        description: "Project directory or ZIP path"
-        required: true
+        description: "Android project folder or ZIP path"
+        required: false
         type: string
+        default: "."
       user_id:
         description: "Telegram user ID"
         required: false
@@ -34,22 +35,22 @@ on:
         type: string
         default: ""
       target_dir:
-        description: "Optional project directory override"
+        description: "Fallback project directory"
         required: false
         type: string
         default: "."
       zip_file:
-        description: "Optional ZIP filename"
+        description: "Project ZIP filename"
         required: false
         type: string
         default: "project.zip"
       build_task:
-        description: "Optional Gradle task override"
+        description: "Gradle task override"
         required: false
         type: string
         default: ""
       build_flavor:
-        description: "Optional Android flavor"
+        description: "Optional Android product flavor"
         required: false
         type: string
         default: ""
@@ -63,20 +64,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-build-${{ github.ref }}-${{ github.run_id }}
+  group: native-build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: Android Native Build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Resolve project path
+      - name: Resolve and extract Android project
         id: project
         shell: bash
         env:
@@ -84,41 +87,138 @@ jobs:
           TARGET_DIR: ${{ inputs.target_dir }}
           ZIP_FILE: ${{ inputs.zip_file }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          PROJECT="$PROJECT_PATH"
+          WORK="$RUNNER_TEMP/native-project"
+          mkdir -p "$WORK"
 
-          if [ -z "$PROJECT" ]; then
-            PROJECT="$TARGET_DIR"
+          PROJECT="${PROJECT_PATH:-}"
+          [ -n "$PROJECT" ] || PROJECT="${TARGET_DIR:-.}"
+
+          # Resolve relative paths from the checked-out repository.
+          if [[ "$PROJECT" != /* ]]; then
+            PROJECT="$GITHUB_WORKSPACE/$PROJECT"
           fi
 
+          ZIP_PATH=""
+
+          # A direct ZIP path was provided.
           if [ -f "$PROJECT" ] && [[ "$PROJECT" == *.zip ]]; then
-            mkdir -p "$RUNNER_TEMP/native-project"
-            unzip -q "$PROJECT" -d "$RUNNER_TEMP/native-project"
-            PROJECT="$RUNNER_TEMP/native-project"
-          elif [ ! -e "$PROJECT" ] && [ -f "$ZIP_FILE" ]; then
-            mkdir -p "$RUNNER_TEMP/native-project"
-            unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/native-project"
-            PROJECT="$RUNNER_TEMP/native-project"
+            ZIP_PATH="$PROJECT"
+
+          # A project directory was provided.
+          elif [ -d "$PROJECT" ]; then
+            # Prefer a Gradle project already inside the directory.
+            GRADLE_FILE="$(find "$PROJECT" \
+              -type f \
+              \( -name settings.gradle -o \
+                 -name settings.gradle.kts -o \
+                 -name build.gradle -o \
+                 -name build.gradle.kts -o \
+                 -name gradlew \) \
+              -not -path '*/.git/*' \
+              -not -path '*/node_modules/*' \
+              -not -path '*/build/*' \
+              -print -quit || true)"
+
+            if [ -n "$GRADLE_FILE" ]; then
+              echo "Gradle project files found in directory."
+            else
+              # No Gradle files: look for the configured ZIP.
+              if [ -f "$PROJECT/$ZIP_FILE" ]; then
+                ZIP_PATH="$PROJECT/$ZIP_FILE"
+              elif [ -f "$GITHUB_WORKSPACE/$ZIP_FILE" ]; then
+                ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_FILE"
+              else
+                # Only auto-select a ZIP if exactly one candidate exists.
+                mapfile -t ZIPS < <(
+                  find "$PROJECT" -maxdepth 2 -type f -name '*.zip' \
+                    -not -path '*/.git/*' | sort
+                )
+
+                if [ "${#ZIPS[@]}" -eq 1 ]; then
+                  ZIP_PATH="${ZIPS[0]}"
+                elif [ "${#ZIPS[@]}" -gt 1 ]; then
+                  echo "::error::Multiple ZIP files found. Set project_path or zip_file explicitly."
+                  printf '%s\n' "${ZIPS[@]}"
+                  exit 1
+                fi
+              fi
+            fi
+          else
+            # A missing path may still refer to a ZIP in the repository.
+            if [ -f "$GITHUB_WORKSPACE/$PROJECT_PATH" ] &&
+               [[ "$PROJECT_PATH" == *.zip ]]; then
+              ZIP_PATH="$GITHUB_WORKSPACE/$PROJECT_PATH"
+            elif [ -f "$GITHUB_WORKSPACE/$ZIP_FILE" ]; then
+              ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_FILE"
+            else
+              echo "::error::Project path does not exist: $PROJECT"
+              exit 1
+            fi
           fi
 
-          if [ ! -d "$PROJECT" ]; then
-            echo "::error::Project directory not found: $PROJECT"
-            echo "Provide a valid project directory or an existing ZIP path."
+          if [ -n "$ZIP_PATH" ]; then
+            echo "ZIP selected: $ZIP_PATH"
+
+            if ! unzip -t "$ZIP_PATH" >/dev/null 2>&1; then
+              echo "::error::ZIP is invalid or corrupted: $ZIP_PATH"
+              exit 1
+            fi
+
+            unzip -oq "$ZIP_PATH" -d "$WORK"
+            PROJECT="$WORK"
+          fi
+
+          # Locate a Gradle root. Prefer settings.gradle(.kts).
+          ROOT=""
+
+          while IFS= read -r FILE; do
+            [ -n "$FILE" ] || continue
+            ROOT="$(dirname "$FILE")"
+            break
+          done < <(
+            find "$PROJECT" -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -not -path '*/.git/*' \
+              -not -path '*/node_modules/*' \
+              -not -path '*/build/*' \
+              -not -path '*/.gradle/*' | sort
+          )
+
+          # Fall back to build files or the Gradle wrapper.
+          if [ -z "$ROOT" ]; then
+            while IFS= read -r FILE; do
+              [ -n "$FILE" ] || continue
+              ROOT="$(dirname "$FILE")"
+              break
+            done < <(
+              find "$PROJECT" -type f \
+                \( -name build.gradle -o \
+                   -name build.gradle.kts -o \
+                   -name gradlew \) \
+                -not -path '*/.git/*' \
+                -not -path '*/node_modules/*' \
+                -not -path '*/build/*' \
+                -not -path '*/.gradle/*' | sort
+            )
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "::error::No Android/Gradle project found."
+            echo "The repository or ZIP must contain settings.gradle(.kts), build.gradle(.kts), or gradlew."
+            echo "Files found for diagnosis:"
+            find "$PROJECT" -maxdepth 4 -type f \
+              -not -path '*/.git/*' | head -150 || true
             exit 1
           fi
 
-          GRADLE_ROOT="$(find "$PROJECT" -type f \( \
-            -name gradlew -o -name build.gradle -o -name build.gradle.kts \
-          \) -print -quit | xargs -r dirname)"
+          ROOT="$(cd "$ROOT" && pwd)"
 
-          if [ -z "$GRADLE_ROOT" ]; then
-            echo "::error::No Gradle project found in $PROJECT"
-            exit 1
-          fi
-
-          echo "path=$GRADLE_ROOT" >> "$GITHUB_OUTPUT"
-          echo "Project root: $GRADLE_ROOT"
+          echo "path=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Project root: $ROOT"
+          echo "Project files:"
+          ls -la "$ROOT" | head -40
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -131,35 +231,37 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
-          yes | sdkmanager --licenses >/dev/null || true
 
       - name: Prepare Gradle project
         shell: bash
-        env:
-          PROJECT_ROOT: ${{ steps.project.outputs.path }}
+        working-directory: ${{ steps.project.outputs.path }}
         run: |
-          set -euo pipefail
-          cd "$PROJECT_ROOT"
+          set -Eeuo pipefail
 
-          if [ ! -f local.properties ]; then
-            printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          fi
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
 
           if [ -f gradlew ]; then
             chmod +x gradlew
-          elif [ -f gradle/wrapper/gradle-wrapper.properties ]; then
-            echo "::error::Gradle wrapper properties exist but gradlew is missing."
-            exit 1
           elif command -v gradle >/dev/null 2>&1; then
-            gradle wrapper
+            gradle wrapper --gradle-version 8.2
             chmod +x gradlew
           else
-            echo "::error::No Gradle wrapper or installed Gradle found."
+            echo "::error::Gradle wrapper is missing and Gradle is unavailable."
+            exit 1
+          fi
+
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::gradle-wrapper.jar is missing."
             exit 1
           fi
 
@@ -171,18 +273,19 @@ jobs:
           BUILD_TASK: ${{ inputs.build_task }}
           BUILD_FLAVOR: ${{ inputs.build_flavor }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           if [ -n "$BUILD_TASK" ]; then
             TASK="$BUILD_TASK"
           else
-            MODE="$(echo "$BUILD_MODE" | tr '[:upper:]' '[:lower:]')"
+            MODE="$(printf '%s' "${BUILD_MODE:-release}" |
+              tr '[:upper:]' '[:lower:]')"
 
             case "$MODE" in
-              debug|assembledebug)
+              debug|assembledebug|apk-debug)
                 TASK="assembleDebug"
                 ;;
-              release|assemblerelease)
+              release|assemblerelease|apk|apk-release|"")
                 TASK="assembleRelease"
                 ;;
               bundle|bundlerelease|aab)
@@ -193,14 +296,30 @@ jobs:
                 ;;
               *)
                 echo "::error::Unsupported build_mode: $BUILD_MODE"
-                echo "Use debug, release, bundle, or bundleDebug."
                 exit 1
                 ;;
             esac
           fi
 
-          if [[ -n "$BUILD_FLAVOR" ]]; then
-            TASK="assemble${BUILD_FLAVOR^}${TASK#assemble}"
+          # Insert the flavor into assemble/bundle task names.
+          if [ -n "$BUILD_FLAVOR" ]; then
+            FLAVOR="$(printf '%s' "$BUILD_FLAVOR" |
+              sed 's/^[a-z]/\U&/')"
+
+            case "$TASK" in
+              assemble*)
+                SUFFIX="${TASK#assemble}"
+                TASK="assemble${FLAVOR}${SUFFIX}"
+                ;;
+              bundle*)
+                SUFFIX="${TASK#bundle}"
+                TASK="bundle${FLAVOR}${SUFFIX}"
+                ;;
+              *)
+                echo "::error::Cannot automatically apply flavor to task: $TASK"
+                exit 1
+                ;;
+            esac
           fi
 
           echo "value=$TASK" >> "$GITHUB_OUTPUT"
@@ -209,60 +328,67 @@ jobs:
       - name: Run native build
         id: build
         shell: bash
+        working-directory: ${{ steps.project.outputs.path }}
         env:
-          PROJECT_ROOT: ${{ steps.project.outputs.path }}
           GRADLE_TASK: ${{ steps.task.outputs.value }}
         run: |
-          set -uo pipefail
-          cd "$PROJECT_ROOT"
+          set -Eeuo pipefail
 
           set +e
-          if [ -x ./gradlew ]; then
-            ./gradlew --no-daemon --stacktrace "$GRADLE_TASK" \
-              2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
-            RESULT=${PIPESTATUS[0]}
-          else
-            echo "::error::Gradle wrapper is not executable."
-            RESULT=1
-          fi
+          ./gradlew --no-daemon --stacktrace "$GRADLE_TASK" \
+            2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+          RESULT=${PIPESTATUS[0]}
           set -e
 
           echo "exit_code=$RESULT" >> "$GITHUB_OUTPUT"
           exit "$RESULT"
 
-      - name: Collect build outputs
+      - name: Collect APK and AAB files
+        id: outputs
         if: always()
         shell: bash
         env:
           PROJECT_ROOT: ${{ steps.project.outputs.path }}
         run: |
-          mkdir -p "$RUNNER_TEMP/native-artifacts"
+          set -Eeuo pipefail
+
+          OUT="$RUNNER_TEMP/native-artifacts"
+          mkdir -p "$OUT"
 
           if [ -d "$PROJECT_ROOT" ]; then
             find "$PROJECT_ROOT" -type f \
               \( -name '*.apk' -o -name '*.aab' \) \
               -path '*/build/outputs/*' \
-              -exec cp --parents '{}' "$RUNNER_TEMP/native-artifacts/" \; \
-              2>/dev/null || true
+              -not -path '*/.gradle/*' \
+              -exec cp --parents '{}' "$OUT/" \; 2>/dev/null || true
           fi
 
           if [ -f "$RUNNER_TEMP/gradle-build.log" ]; then
-            cp "$RUNNER_TEMP/gradle-build.log" \
-              "$RUNNER_TEMP/native-artifacts/gradle-build.log"
+            cp "$RUNNER_TEMP/gradle-build.log" "$OUT/gradle-build.log"
           fi
 
           {
+            echo "Native Build Information"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Run number: $GITHUB_RUN_NUMBER"
+            echo "Project path: ${{ inputs.project_path }}"
+            echo "Server: ${{ inputs.server }}"
             echo "Build mode: ${{ inputs.build_mode }}"
             echo "Build task: ${{ steps.task.outputs.value }}"
-            echo "Project: ${{ inputs.project_path }}"
-            echo "Server: ${{ inputs.server }}"
+            echo "Build flavor: ${{ inputs.build_flavor }}"
+            echo "Java version: ${{ inputs.java_version }}"
             echo "Telegram user ID: ${{ inputs.user_id }}"
             echo "Telegram username: ${{ inputs.username }}"
             echo "Telegram name: ${{ inputs.user_name }}"
-            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          } > "$RUNNER_TEMP/native-artifacts/build-info.txt"
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$OUT/build-info.txt"
 
-      - name: Upload build artifacts
+          echo "Artifact files:"
+          find "$OUT" -type f -print
+
+      - name: Upload native build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -281,9 +407,11 @@ jobs:
           {
             echo "## Native Build Summary"
             echo ""
-            echo "- **Repository:** $GITHUB_REPOSITORY"
-            echo "- **Run:** $GITHUB_RUN_NUMBER"
-            echo "- **Task:** ${BUILD_TASK:-not selected}"
-            echo "- **Exit code:** ${BUILD_RESULT:-not available}"
-            echo "- **Artifacts:** native-build-$GITHUB_RUN_NUMBER"
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Run: $GITHUB_RUN_NUMBER"
+            echo "- Task: ${BUILD_TASK:-not selected}"
+            echo "- Exit code: ${BUILD_RESULT:-not available}"
+            echo "- Artifact: native-build-$GITHUB_RUN_NUMBER"
+            echo "- User ID: ${{ inputs.user_id }}"
+            echo "- Username: ${{ inputs.username }}"
           } >> "$GITHUB_STEP_SUMMARY"
