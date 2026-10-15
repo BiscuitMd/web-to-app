@@ -25,6 +25,10 @@ on:
       user_name:
         required: false
         type: string
+      base_zip_path:
+        description: Path to uploaded Flutter base ZIP in this repository
+        required: false
+        type: string
 permissions:
   contents: read
   actions: read
@@ -37,6 +41,23 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare uploaded Flutter base ZIP
+        if: ${{ inputs.base_zip_path != '' }}
+        shell: bash
+        env:
+          BASE_ZIP_PATH: ${{ inputs.base_zip_path }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$BASE_ZIP_PATH" ]; then
+            echo "Uploaded base ZIP not found: $BASE_ZIP_PATH"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/flutter-base"
+          unzip -q "$BASE_ZIP_PATH" -d "$RUNNER_TEMP/flutter-base"
+          # Use uploaded ZIP as the project source. The workflow's detection step
+          # searches this folder recursively for pubspec.yaml/pubspec.yml.
+          echo "Uploaded Flutter base extracted to $RUNNER_TEMP/flutter-base"
+          echo "FLUTTER_INPUT_DIR=$RUNNER_TEMP/flutter-base" >> "$GITHUB_ENV"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -47,7 +68,7 @@ jobs:
           REQUESTED_PROJECT_PATH: ${{ inputs.project_path }}
         run: |
           set -euo pipefail
-          requested="${REQUESTED_PROJECT_PATH:-.}"
+          requested="${FLUTTER_INPUT_DIR:-${REQUESTED_PROJECT_PATH:-.}}"
           if [ ! -d "$requested" ]; then
             echo "Project path does not exist: $requested"
             exit 1
