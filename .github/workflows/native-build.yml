@@ -1026,15 +1026,11 @@ jobs:
           flutter pub get
 
       # ============================================================
-      # FIX DART ICON TYPES (FaIconData vs IconData)
-      # font_awesome_flutter 11.x mengembalikan FaIconData (bukan
-      # IconData). Kode user yang pakai Icon(FontAwesomeIcons.xxx)
-      # atau fungsi helper bertipe IconData perlu disesuaikan.
-      # Transformasi:
-      #   1) Icon(FontAwesomeIcons.xxx, ...)  -> FaIcon(FontAwesomeIcons.xxx, ...)
-      #      (single-line & multi-line)
-      #   2) IconData -> FaIconData, tapi HANYA pada file yang
-      #      mengimport font_awesome_flutter DAN memakai FontAwesomeIcons.
+      # FIX DART FONT AWESOME ICON USAGES
+      # font_awesome_flutter 11.x: FontAwesomeIcons.xxx bertipe
+      # FaIconData (bukan IconData). Solusi paling aman: tambahkan
+      # .iconData di belakangnya sehingga kembali ke IconData biasa,
+      # tanpa mengubah tipe parameter/widget apa pun.
       # ============================================================
       - name: Fix Dart Font Awesome Icon Types
         if: steps.flutter_detect.outputs.is_flutter == 'true'
@@ -1073,7 +1069,6 @@ jobs:
               except (OSError, UnicodeError):
                   continue
 
-              # Hanya proses file yang berhubungan dengan font_awesome_flutter
               if "font_awesome_flutter" not in content:
                   continue
               if "FontAwesomeIcons." not in content:
@@ -1081,17 +1076,22 @@ jobs:
 
               original = content
 
-              # 1) Icon(FontAwesomeIcons.xxx, ...) -> FaIcon(FontAwesomeIcons.xxx, ...)
-              #    \s* mencakup spasi/newline sehingga multi-line tetap kena.
+              # 1) Hapus 'const' HANYA di depan Icon(FontAwesomeIcons.xxx)
+              #    karena .iconData adalah field access dan tidak selalu
+              #    aman di dalam konteks const.
               content = re.sub(
-                  r'\bIcon\(\s*FontAwesomeIcons\.',
-                  'FaIcon(FontAwesomeIcons.',
+                  r'\bconst\s+Icon\(\s*FontAwesomeIcons\.',
+                  'Icon(FontAwesomeIcons.',
                   content,
               )
 
-              # 2) IconData -> FaIconData (word boundary agar tidak
-              #    mengganggu IconThemeData / IconDataProperty dsb.)
-              content = re.sub(r'\bIconData\b', 'FaIconData', content)
+              # 2) Tambahkan .iconData setelah FontAwesomeIcons.xxx
+              #    (kecuali yang sudah punya .iconData).
+              content = re.sub(
+                  r'\bFontAwesomeIcons\.(\w+)(?!\.iconData)\b',
+                  r'FontAwesomeIcons.\1.iconData',
+                  content,
+              )
 
               if content != original:
                   path.write_text(content, encoding="utf-8")
