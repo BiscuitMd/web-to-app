@@ -1026,6 +1026,84 @@ jobs:
           flutter pub get
 
       # ============================================================
+      # FIX DART ICON TYPES (FaIconData vs IconData)
+      # font_awesome_flutter 11.x mengembalikan FaIconData (bukan
+      # IconData). Kode user yang pakai Icon(FontAwesomeIcons.xxx)
+      # atau fungsi helper bertipe IconData perlu disesuaikan.
+      # Transformasi:
+      #   1) Icon(FontAwesomeIcons.xxx, ...)  -> FaIcon(FontAwesomeIcons.xxx, ...)
+      #      (single-line & multi-line)
+      #   2) IconData -> FaIconData, tapi HANYA pada file yang
+      #      mengimport font_awesome_flutter DAN memakai FontAwesomeIcons.
+      # ============================================================
+      - name: Fix Dart Font Awesome Icon Types
+        if: steps.flutter_detect.outputs.is_flutter == 'true'
+        working-directory: ${{ steps.flutter_detect.outputs.flutter_root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - "$PWD" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          excluded = {
+              ".git", ".gradle", "build", "node_modules",
+              ".dart_tool", "android", "ios", "web",
+              "linux", "macos", "windows",
+          }
+
+          def should_skip(path: pathlib.Path) -> bool:
+              try:
+                  rel = path.relative_to(root)
+              except ValueError:
+                  return True
+              return any(part in excluded for part in rel.parts)
+
+          total = 0
+          changed_files = []
+
+          for path in root.rglob("*.dart"):
+              if should_skip(path):
+                  continue
+              try:
+                  content = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError):
+                  continue
+
+              # Hanya proses file yang berhubungan dengan font_awesome_flutter
+              if "font_awesome_flutter" not in content:
+                  continue
+              if "FontAwesomeIcons." not in content:
+                  continue
+
+              original = content
+
+              # 1) Icon(FontAwesomeIcons.xxx, ...) -> FaIcon(FontAwesomeIcons.xxx, ...)
+              #    \s* mencakup spasi/newline sehingga multi-line tetap kena.
+              content = re.sub(
+                  r'\bIcon\(\s*FontAwesomeIcons\.',
+                  'FaIcon(FontAwesomeIcons.',
+                  content,
+              )
+
+              # 2) IconData -> FaIconData (word boundary agar tidak
+              #    mengganggu IconThemeData / IconDataProperty dsb.)
+              content = re.sub(r'\bIconData\b', 'FaIconData', content)
+
+              if content != original:
+                  path.write_text(content, encoding="utf-8")
+                  total += 1
+                  changed_files.append(str(path.relative_to(root)))
+
+          print(f"Dart files fixed: {total}")
+          for f in changed_files:
+              print(f"  - {f}")
+          PY
+
+      # ============================================================
       # BUILD WITH LIMITED COMPATIBILITY AUTO-RETRY
       # ============================================================
       - name: Build with Gradle
