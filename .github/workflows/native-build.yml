@@ -222,7 +222,6 @@ jobs:
 
           unzip -o "$ZIP_PATH" -d "$EXTRACT_DIR"
           echo "Extracted size: $(du -sh "$EXTRACT_DIR" | awk '{print $1}')"
-
           echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
 
       # ============================================================
@@ -409,8 +408,7 @@ jobs:
           flutter pub get
 
       # ============================================================
-      # AUTO FIX AGP + GRADLE COMPATIBILITY
-      # AGP first, then select Gradle.
+      # AUTO FIX AGP
       # ============================================================
       - name: Auto Fix Android Gradle Plugin
         id: agp_fix
@@ -423,41 +421,23 @@ jobs:
 
           ROOT="$PWD"
           MIN_AGP="8.11.1"
-          TARGET_AGP="$MIN_AGP"
 
-          # The Flutter error in the supplied build log explicitly
-          # requires AGP 8.11.1. For non-Flutter projects, do not force
-          # an AGP upgrade.
           if [ "$IS_FLUTTER" != "true" ]; then
             echo "version=unchanged" >> "$GITHUB_OUTPUT"
             echo "minimum=$MIN_AGP" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          python3 - "$ROOT" "$TARGET_AGP" <<'PY'
-          import pathlib, re, sys
+          python3 - "$ROOT" "$MIN_AGP" <<'PY'
+          import pathlib
+          import re
+          import sys
 
           root = pathlib.Path(sys.argv[1])
           target = sys.argv[2]
+          minimum = tuple(map(int, target.split(".")))
+          excluded = {".git", ".gradle", "build", "node_modules"}
 
-          candidates = []
-          for pattern in (
-              "settings.gradle", "settings.gradle.kts",
-              "build.gradle", "build.gradle.kts",
-              "gradle/libs.versions.toml",
-          ):
-              candidates.extend(root.rglob(pattern))
-
-          candidates = [
-              p for p in candidates
-              if not any(part in {
-                  ".gradle", ".git", "build", "node_modules"
-              } for part in p.parts)
-              and len(p.relative_to(root).parts) <= 6
-          ]
-
-          # Update only explicit AGP version declarations. Do not rewrite
-          # arbitrary numbers or unrelated dependencies.
           patterns = [
               re.compile(
                   r'(?P<prefix>com\.android\.tools\.build:gradle:)'
@@ -479,82 +459,261 @@ jobs:
               ),
           ]
 
-          changed = []
-          for path in candidates:
+          def replace(match):
+              version = match.group("version")
               try:
-                  original = path.read_text()
+                  parts = tuple(map(int, version.split(".")))
+              except ValueError:
+                  return match.group(0)
+              if parts < minimum:
+                  return (
+                      match.group("prefix") + target
+                      + match.groupdict().get("suffix", "")
+                  )
+              return match.group(0)
+
+          changed = []
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              if any(part in excluded for part in path.relative_to(root).parts):
+                  continue
+              if len(path.relative_to(root).parts) > 8:
+                  continue
+              if path.name not in {
+                  "settings.gradle", "settings.gradle.kts",
+                  "build.gradle", "build.gradle.kts", "libs.versions.toml"
+              }:
+                  continue
+
+              try:
+                  original = path.read_text(encoding="utf-8")
               except (OSError, UnicodeError):
                   continue
 
               updated = original
               for pattern in patterns:
-                  def replace(match):
-                      version = match.group("version")
-                      parts = tuple(int(x) for x in version.split("."))
-                      minimum = tuple(int(x) for x in target.split("."))
-                      if parts < minimum:
-                          return (
-                              match.group("prefix") + target +
-                              match.groupdict().get("suffix", "")
-                          )
-                      return match.group(0)
-
                   updated = pattern.sub(replace, updated)
 
+              if path.name == "libs.versions.toml":
+                  section = re.search(
+                      r'(?ms)^\[versions\]\s*(.*?)(?=^\[|\Z)',
+                      updated
+                  )
+                  if section:
+                      start, end = section.span(1)
+                      block = section.group(1)
+                      block = re.sub(
+                          r'(?m)^(\s*(?:agp|androidGradlePlugin)\s*=\s*["\'])'
+                          r'(\d+(?:\.\d+){1,2})(["\'])',
+                          lambda m: (
+                              m.group(1) + target + m.group(3)
+                              if tuple(map(int, m.group(2).split("."))) < minimum
+                              else m.group(0)
+                          ),
+                          block
+                      )
+                      updated = updated[:start] + block + updated[end:]
+
               if updated != original:
-                  path.write_text(updated)
+                  path.write_text(updated, encoding="utf-8")
                   changed.append(str(path.relative_to(root)))
 
-          print("Files updated:", changed if changed else "none")
+          print("AGP files updated:", changed or "none")
           PY
 
-          # Read the effective explicit AGP declarations again.
-          AGP_FOUND="$(
-            grep -RhoE \
-              'com\.android\.tools\.build:gradle:[0-9]+(\.[0-9]+){1,2}|com\.android\.(application|library|test|dynamic-feature).*version[[:space:]]*["'\''][0-9]+(\.[0-9]+){1,2}' \
-              "$ROOT" \
-              --include='*.gradle' --include='*.gradle.kts' \
-              --exclude-dir=.gradle --exclude-dir=build \
-              --exclude-dir=node_modules 2>/dev/null |
-            grep -oE '[0-9]+(\.[0-9]+){1,2}$' |
-            sort -V | tail -n 1 || true
-          )"
-
-          CATALOG="$ROOT/gradle/libs.versions.toml"
-          if [ -f "$CATALOG" ]; then
-            CATALOG_AGP="$(
-              python3 - "$CATALOG" <<'PY'
-          import re, sys
-          text = open(sys.argv[1]).read()
-          section = re.search(r'(?ms)^\[versions\]\s*(.*?)(?=^\[|\Z)', text)
-          if section:
-              m = re.search(
-                  r'(?m)^\s*(?:agp|androidGradlePlugin)\s*=\s*["\'](\d+(?:\.\d+){1,2})["\']',
-                  section.group(1)
-              )
-              if m:
-                  print(m.group(1))
-          PY
-            )"
-            [ -z "$CATALOG_AGP" ] || AGP_FOUND="$CATALOG_AGP"
-          fi
-
-          if [ -n "$AGP_FOUND" ]; then
-            LOW="$(
-              printf '%s\n%s\n' "$AGP_FOUND" "$MIN_AGP" |
-              sort -V | head -n 1
-            )"
-            if [ "$LOW" != "$AGP_FOUND" ]; then
-              echo "::error::AGP masih di bawah minimum Flutter: $AGP_FOUND"
-              echo "::error::Project menggunakan deklarasi AGP yang belum tertangani."
-              exit 1
-            fi
-          else
-            echo "::warning::Deklarasi versi AGP tidak terdeteksi dengan pola umum."
-          fi
-
-          echo "version=${AGP_FOUND:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "version=$MIN_AGP" >> "$GITHUB_OUTPUT"
           echo "minimum=$MIN_AGP" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # AUTO FIX KOTLIN VERSION
+      # Fixes common explicit Kotlin versions and version catalogs.
+      # ============================================================
+      - name: Auto Fix Kotlin Compatibility
+        id: kotlin_fix
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        env:
+          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="$PWD"
+          MIN_KOTLIN="2.2.20"
+
+          if [ "$IS_FLUTTER" != "true" ]; then
+            echo "version=unchanged" >> "$GITHUB_OUTPUT"
+            echo "minimum=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - "$ROOT" "$MIN_KOTLIN" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          target = sys.argv[2]
+          minimum = tuple(map(int, target.split(".")))
+          excluded = {".git", ".gradle", "build", "node_modules", ".dart_tool"}
+
+          plugin_patterns = [
+              re.compile(
+                  r'(?P<prefix>\bid\s*\(?\s*["\']'
+                  r'org\.jetbrains\.kotlin\.(?:android|jvm|multiplatform|kapt|plugin\.serialization)'
+                  r'["\']\s*\)?\s+version\s+["\'])'
+                  r'(?P<version>\d+(?:\.\d+){1,3})'
+                  r'(?P<suffix>["\'])'
+              ),
+              re.compile(
+                  r'(?P<prefix>\bkotlin\s*\(\s*["\']'
+                  r'(?:android|jvm|multiplatform|kapt)'
+                  r'["\']\s*\)\s+version\s+["\'])'
+                  r'(?P<version>\d+(?:\.\d+){1,3})'
+                  r'(?P<suffix>["\'])'
+              ),
+              re.compile(
+                  r'(?P<prefix>\borg\.jetbrains\.kotlin:'
+                  r'kotlin-gradle-plugin:)'
+                  r'(?P<version>\d+(?:\.\d+){1,3})'
+              ),
+              re.compile(
+                  r'(?P<prefix>\b(?:ext\.)?kotlin_version\s*=\s*["\'])'
+                  r'(?P<version>\d+(?:\.\d+){1,3})'
+                  r'(?P<suffix>["\'])'
+              ),
+          ]
+
+          def replace_version(match):
+              try:
+                  current = tuple(map(int, match.group("version").split(".")))
+              except ValueError:
+                  return match.group(0)
+              if current < minimum:
+                  return (
+                      match.group("prefix") + target
+                      + match.groupdict().get("suffix", "")
+                  )
+              return match.group(0)
+
+          changed = []
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              relative = path.relative_to(root)
+              if any(part in excluded for part in relative.parts):
+                  continue
+              if len(relative.parts) > 8:
+                  continue
+              if path.name not in {
+                  "settings.gradle", "settings.gradle.kts",
+                  "build.gradle", "build.gradle.kts", "libs.versions.toml"
+              }:
+                  continue
+
+              try:
+                  original = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError):
+                  continue
+
+              updated = original
+              for pattern in plugin_patterns:
+                  updated = pattern.sub(replace_version, updated)
+
+              # Version catalog: only edit Kotlin keys inside [versions].
+              if path.name == "libs.versions.toml":
+                  sections = list(re.finditer(
+                      r'(?m)^\[([^\]]+)\]\s*$',
+                      updated
+                  ))
+                  for index, section in enumerate(sections):
+                      if section.group(1).strip() != "versions":
+                          continue
+
+                      start = section.end()
+                      end = (
+                          sections[index + 1].start()
+                          if index + 1 < len(sections)
+                          else len(updated)
+                      )
+                      block = updated[start:end]
+
+                      block = re.sub(
+                          r'(?m)^(\s*(?:kotlin|kotlinVersion|kotlin_version|'
+                          r'kotlinAndroid|kotlin-android)\s*=\s*["\'])'
+                          r'(\d+(?:\.\d+){1,3})(["\'])',
+                          lambda m: (
+                              m.group(1) + target + m.group(3)
+                              if tuple(map(int, m.group(2).split("."))) < minimum
+                              else m.group(0)
+                          ),
+                          block
+                      )
+                      updated = updated[:start] + block + updated[end:]
+                      break
+
+              if updated != original:
+                  path.write_text(updated, encoding="utf-8")
+                  changed.append(str(relative))
+
+          print("Kotlin files updated:", changed or "none")
+          PY
+
+          # Check common explicit declarations. Fail early if an old
+          # literal version remains, instead of wasting a build attempt.
+          python3 - "$ROOT" "$MIN_KOTLIN" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          target = sys.argv[2]
+          minimum = tuple(map(int, target.split(".")))
+          excluded = {".git", ".gradle", "build", "node_modules", ".dart_tool"}
+          patterns = [
+              r'org\.jetbrains\.kotlin\.(?:android|jvm|multiplatform|kapt|plugin\.serialization)["\']\s*\)?\s+version\s+["\'](\d+(?:\.\d+){1,3})',
+              r'kotlin\s*\(\s*["\'](?:android|jvm|multiplatform|kapt)["\']\s*\)\s+version\s+["\'](\d+(?:\.\d+){1,3})',
+              r'org\.jetbrains\.kotlin:kotlin-gradle-plugin:(\d+(?:\.\d+){1,3})',
+              r'\b(?:ext\.)?kotlin_version\s*=\s*["\'](\d+(?:\.\d+){1,3})',
+          ]
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              relative = path.relative_to(root)
+              if any(part in excluded for part in relative.parts):
+                  continue
+              if len(relative.parts) > 8:
+                  continue
+              if path.name not in {
+                  "settings.gradle", "settings.gradle.kts",
+                  "build.gradle", "build.gradle.kts"
+              }:
+                  continue
+
+              try:
+                  content = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError):
+                  continue
+
+              for pattern in patterns:
+                  for match in re.finditer(pattern, content):
+                      version = match.group(1)
+                      parsed = tuple(map(int, version.split(".")))
+                      print(f"Kotlin declaration: {relative}: {version}")
+                      if parsed < minimum:
+                          print(
+                              f"::error::Kotlin {version} masih di bawah "
+                              f"minimum {target}: {relative}"
+                          )
+                          sys.exit(1)
+
+          print("Kotlin explicit-version validation passed.")
+          PY
+
+          echo "version=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
+          echo "minimum=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
 
       # ============================================================
       # AUTO SELECT GRADLE
@@ -573,9 +732,8 @@ jobs:
           WRAPPER="$ROOT/gradle/wrapper/gradle-wrapper.properties"
           SELECTED=""
           REQUIRED="8.0"
-
-          # Baseline based on AGP compatibility.
           AGP="${AGP_VERSION:-unknown}"
+
           if [[ "$AGP" =~ ^([0-9]+)\.([0-9]+) ]]; then
             MAJOR="${BASH_REMATCH[1]}"
             MINOR="${BASH_REMATCH[2]}"
@@ -611,9 +769,7 @@ jobs:
             fi
           fi
 
-          # Flutter stable currently warns about older Gradle versions;
-          # use Gradle 8.14.3 with AGP 8.11.x, not a guessed Gradle 9
-          # for all Flutter projects.
+          # Keep the known Flutter + AGP 8.11.x combination on Gradle 8.
           if [ "$IS_FLUTTER" = "true" ]; then
             REQUIRED="8.14.3"
           fi
@@ -626,9 +782,7 @@ jobs:
             )"
           fi
 
-          if [ -z "$SELECTED" ]; then
-            SELECTED="$REQUIRED"
-          fi
+          [ -n "$SELECTED" ] || SELECTED="$REQUIRED"
 
           HIGHEST="$(
             printf '%s\n%s\n' "$SELECTED" "$REQUIRED" |
@@ -639,7 +793,8 @@ jobs:
           fi
 
           DIST_TYPE="bin"
-          if [ -f "$WRAPPER" ] && grep -qE 'gradle-[^/]*-all\.zip' "$WRAPPER"; then
+          if [ -f "$WRAPPER" ] &&
+             grep -qE 'gradle-[^/]*-all\.zip' "$WRAPPER"; then
             DIST_TYPE="all"
           fi
 
@@ -697,7 +852,6 @@ jobs:
 
           chmod +x gradlew
 
-          # Ensure wrapper properties and selected version agree.
           sed -i -E \
             "s#^distributionUrl=.*#distributionUrl=https\\\\://services.gradle.org/distributions/gradle-${DETECTED_GRADLE_VERSION}-bin.zip#" \
             gradle/wrapper/gradle-wrapper.properties
@@ -849,6 +1003,7 @@ jobs:
 
           echo "Gradle: ${{ steps.gradle_version.outputs.version }}"
           echo "AGP: ${{ steps.gradle_version.outputs.agp_version }}"
+          echo "Kotlin minimum: ${{ steps.kotlin_fix.outputs.minimum }}"
           echo "Task: $FINAL_TASK"
 
           MAX_ATTEMPTS=2
@@ -869,9 +1024,6 @@ jobs:
             [ "$EXIT_CODE" -eq 0 ] && break
             [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] || break
 
-            # Retry only when the log identifies a known, safely
-            # recoverable cache/daemon issue. Do not rewrite arbitrary
-            # application code or hide genuine compilation failures.
             if grep -Eqi \
               'Gradle build daemon disappeared unexpectedly|Could not .*lock.*file|already locked by this process|corrupt.*cache|Could not open.*cache' \
               /tmp/gradle.log; then
@@ -883,9 +1035,13 @@ jobs:
             fi
 
             if grep -Eqi \
+              'Your project.s Kotlin version.*lower than Flutter.s minimum supported version|Unsupported Kotlin plugin version' \
+              /tmp/gradle.log; then
+              echo "::error::Kotlin masih tidak kompatibel. Periksa alias plugin atau versi Kotlin yang ditentukan oleh script eksternal."
+            elif grep -Eqi \
               'Your project.s Android Gradle Plugin version.*lower than Flutter.s minimum supported version' \
               /tmp/gradle.log; then
-              echo "::error::AGP yang efektif masih terlalu lama. Deklarasi versi yang dipakai proyek belum terdeteksi oleh auto-fix."
+              echo "::error::AGP yang efektif masih terlalu lama. Periksa alias plugin atau deklarasi versi eksternal."
             elif grep -Eqi \
               'flutter.sdk not set in local.properties|Flutter SDK not found' \
               /tmp/gradle.log; then
@@ -893,7 +1049,7 @@ jobs:
             elif grep -Eqi \
               'Unsupported class file major version|requires Java|Java .* is not supported' \
               /tmp/gradle.log; then
-              echo "::error::Terdeteksi ketidakcocokan Java/Gradle. Sesuaikan Java dengan persyaratan Gradle proyek."
+              echo "::error::Terdeteksi ketidakcocokan Java/Gradle."
             fi
 
             break
@@ -981,6 +1137,7 @@ jobs:
           GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
           REQUIRED_GRADLE: ${{ steps.gradle_version.outputs.required_version }}
           AGP_VERSION: ${{ steps.gradle_version.outputs.agp_version }}
+          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.version }}
         run: |
           {
             echo "=== NATIVE BUILD INFO ==="
@@ -1005,6 +1162,7 @@ jobs:
             echo "Gradle Version: $GRADLE_VERSION"
             echo "Required Gradle: $REQUIRED_GRADLE"
             echo "AGP Version: $AGP_VERSION"
+            echo "Kotlin Minimum/Target: $KOTLIN_VERSION"
             echo "Commit: $GITHUB_SHA"
             echo "Actor: $GITHUB_ACTOR"
             echo "Finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -1068,6 +1226,7 @@ jobs:
           GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
           REQUIRED_GRADLE: ${{ steps.gradle_version.outputs.required_version }}
           AGP_VERSION: ${{ steps.gradle_version.outputs.agp_version }}
+          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.version }}
         run: |
           {
             echo "## Native Build Summary"
@@ -1086,5 +1245,6 @@ jobs:
             echo "| Gradle Version | $GRADLE_VERSION |"
             echo "| Required Gradle | $REQUIRED_GRADLE |"
             echo "| AGP Version | $AGP_VERSION |"
+            echo "| Kotlin Minimum/Target | $KOTLIN_VERSION |"
             echo "| Status | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
