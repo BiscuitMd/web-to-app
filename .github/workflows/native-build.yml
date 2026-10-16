@@ -57,6 +57,11 @@ on:
         required: false
         default: "17"
         type: string
+      flutter_version:
+        description: "Versi Flutter (kosongkan untuk stable terbaru)"
+        required: false
+        default: "3.24.5"
+        type: string
 
 permissions:
   contents: read
@@ -394,6 +399,7 @@ jobs:
         if: steps.flutter_detect.outputs.is_flutter == 'true'
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ inputs.flutter_version || '3.24.5' }}
           channel: stable
           cache: true
 
@@ -620,7 +626,6 @@ jobs:
               for pattern in plugin_patterns:
                   updated = pattern.sub(replace_version, updated)
 
-              # Version catalog: only edit Kotlin keys inside [versions].
               if path.name == "libs.versions.toml":
                   sections = list(re.finditer(
                       r'(?m)^\[([^\]]+)\]\s*$',
@@ -659,8 +664,6 @@ jobs:
           print("Kotlin files updated:", changed or "none")
           PY
 
-          # Check common explicit declarations. Fail early if an old
-          # literal version remains, instead of wasting a build attempt.
           python3 - "$ROOT" "$MIN_KOTLIN" <<'PY'
           import pathlib
           import re
@@ -768,7 +771,6 @@ jobs:
             fi
           fi
 
-          # Keep the known Flutter + AGP 8.11.x combination on Gradle 8.
           if [ "$IS_FLUTTER" = "true" ]; then
             REQUIRED="8.14.3"
           fi
@@ -962,11 +964,8 @@ jobs:
 
       # ============================================================
       # FIX font_awesome_flutter COMPATIBILITY
-      # Flutter stable 3.47.7+ menandai class IconData sebagai final,
-      # sedangkan font_awesome_flutter 10.x masih meng-extend IconData,
-      # sehingga compileFlutterBuildRelease gagal. Versi 11.x sudah
-      # memperbaiki ini dengan FaIconData wrapper. Step ini force
-      # upgrade dependency ke ^11.0.0 sebelum build Gradle dijalankan.
+      # Dengan Flutter di-pin ke 3.24.5, font_awesome_flutter 10.x
+      # kompatibel langsung tanpa upgrade. Step ini hanya log info.
       # ============================================================
       - name: Fix font_awesome_flutter Compatibility
         if: steps.flutter_detect.outputs.is_flutter == 'true'
@@ -974,63 +973,14 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          PUBSPEC="pubspec.yaml"
-          if [ ! -f "$PUBSPEC" ]; then
-            echo "::warning::pubspec.yaml tidak ditemukan, skip fix font_awesome_flutter."
-            exit 0
-          fi
-
-          if ! grep -qE '^[ \t]*font_awesome_flutter[ \t]*:' "$PUBSPEC"; then
-            echo "font_awesome_flutter tidak dipakai di project ini, skip."
-            exit 0
-          fi
-
-          echo "font_awesome_flutter ditemukan di pubspec.yaml, force upgrade ke ^11.0.0..."
-
-          python3 - "$PUBSPEC" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          try:
-              text = path.read_text(encoding="utf-8")
-          except (OSError, UnicodeError) as exc:
-              print(f"::warning::Gagal baca pubspec.yaml: {exc}")
-              sys.exit(0)
-
-          pattern = re.compile(
-              r'^(?P<indent>[ \t]*)font_awesome_flutter[ \t]*:[ \t]*.*$',
-              re.MULTILINE,
-          )
-
-          def replace(match):
-              indent = match.group("indent")
-              return f'{indent}font_awesome_flutter: ^11.0.0'
-
-          new_text, count = pattern.subn(replace, text)
-
-          if count == 0:
-              print("::warning::Baris font_awesome_flutter tidak ditemukan saat replace.")
-              sys.exit(0)
-
-          path.write_text(new_text, encoding="utf-8")
-          print(f"Berhasil update {count} baris font_awesome_flutter ke ^11.0.0")
-          PY
-
-          echo "pubspec.yaml setelah update:"
-          grep -n 'font_awesome_flutter' "$PUBSPEC" || true
-
-          # Sync dependency setelah update
-          flutter pub get
+          echo "Di-skip: Flutter di-pin ke versi kompatibel, font_awesome_flutter 10.x dipakai apa adanya."
+          echo "Tidak ada perubahan pubspec.yaml."
 
       # ============================================================
       # FIX DART FONT AWESOME ICON USAGES
-      # font_awesome_flutter 11.x: FontAwesomeIcons.xxx bertipe
-      # FaIconData (bukan IconData). Solusi paling aman: tambahkan
-      # .iconData di belakangnya sehingga kembali ke IconData biasa,
-      # tanpa mengubah tipe parameter/widget apa pun.
+      # Dengan font_awesome_flutter 10.x, FontAwesomeIcons.xxx
+      # tetap bertipe IconData sehingga tidak perlu transformasi.
+      # Step ini hanya log info.
       # ============================================================
       - name: Fix Dart Font Awesome Icon Types
         if: steps.flutter_detect.outputs.is_flutter == 'true'
@@ -1038,70 +988,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          python3 - "$PWD" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          excluded = {
-              ".git", ".gradle", "build", "node_modules",
-              ".dart_tool", "android", "ios", "web",
-              "linux", "macos", "windows",
-          }
-
-          def should_skip(path: pathlib.Path) -> bool:
-              try:
-                  rel = path.relative_to(root)
-              except ValueError:
-                  return True
-              return any(part in excluded for part in rel.parts)
-
-          total = 0
-          changed_files = []
-
-          for path in root.rglob("*.dart"):
-              if should_skip(path):
-                  continue
-              try:
-                  content = path.read_text(encoding="utf-8")
-              except (OSError, UnicodeError):
-                  continue
-
-              if "font_awesome_flutter" not in content:
-                  continue
-              if "FontAwesomeIcons." not in content:
-                  continue
-
-              original = content
-
-              # 1) Hapus 'const' HANYA di depan Icon(FontAwesomeIcons.xxx)
-              #    karena .iconData adalah field access dan tidak selalu
-              #    aman di dalam konteks const.
-              content = re.sub(
-                  r'\bconst\s+Icon\(\s*FontAwesomeIcons\.',
-                  'Icon(FontAwesomeIcons.',
-                  content,
-              )
-
-              # 2) Tambahkan .iconData setelah FontAwesomeIcons.xxx
-              #    (kecuali yang sudah punya .iconData).
-              content = re.sub(
-                  r'\bFontAwesomeIcons\.(\w+)(?!\.iconData)\b',
-                  r'FontAwesomeIcons.\1.iconData',
-                  content,
-              )
-
-              if content != original:
-                  path.write_text(content, encoding="utf-8")
-                  total += 1
-                  changed_files.append(str(path.relative_to(root)))
-
-          print(f"Dart files fixed: {total}")
-          for f in changed_files:
-              print(f"  - {f}")
-          PY
+          echo "Di-skip: tidak ada transformasi Dart yang diperlukan dengan font_awesome_flutter 10.x."
 
       # ============================================================
       # BUILD WITH LIMITED COMPATIBILITY AUTO-RETRY
@@ -1273,6 +1160,7 @@ jobs:
           BUILD_TASK: ${{ inputs.build_task }}
           BUILD_FLAVOR: ${{ inputs.build_flavor }}
           JAVA_VERSION: ${{ inputs.java_version }}
+          FLUTTER_VERSION: ${{ inputs.flutter_version }}
           PROJECT_ROOT: ${{ steps.detect.outputs.root }}
           IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
           FLUTTER_ROOT: ${{ steps.flutter_detect.outputs.flutter_root }}
@@ -1298,6 +1186,7 @@ jobs:
             echo "Build Task: $BUILD_TASK"
             echo "Build Flavor: $BUILD_FLAVOR"
             echo "Java Version: $JAVA_VERSION"
+            echo "Flutter Version: $FLUTTER_VERSION"
             echo "Project Root: $PROJECT_ROOT"
             echo "Flutter Project: $IS_FLUTTER"
             echo "Flutter Root: $FLUTTER_ROOT"
@@ -1364,11 +1253,12 @@ jobs:
           BUILD_TASK: ${{ inputs.build_task }}
           BUILD_FLAVOR: ${{ inputs.build_flavor }}
           JAVA_VERSION: ${{ inputs.java_version }}
+          FLUTTER_VERSION: ${{ inputs.flutter_version }}
           IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
           GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
           REQUIRED_GRADLE: ${{ steps.gradle_version.outputs.required_version }}
           AGP_VERSION: ${{ steps.gradle_version.outputs.agp_version }}
-          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.version }}
+          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.minimum }}
         run: |
           {
             echo "## Native Build Summary"
@@ -1383,6 +1273,7 @@ jobs:
             echo "| Build Task | $BUILD_TASK |"
             echo "| Flavor | $BUILD_FLAVOR |"
             echo "| Java | $JAVA_VERSION |"
+            echo "| Flutter | $FLUTTER_VERSION |"
             echo "| Flutter Project | $IS_FLUTTER |"
             echo "| Gradle Version | $GRADLE_VERSION |"
             echo "| Required Gradle | $REQUIRED_GRADLE |"
