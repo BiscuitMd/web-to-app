@@ -425,23 +425,20 @@ jobs:
 
           EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
           GRADLE_ROOT="${{ steps.detect.outputs.root }}"
-          FLUTTER_ROOT=""
+          FLUTTER_PROJECT_ROOT=""
 
-          # A Flutter Android project normally has pubspec.yaml above
-          # its android/ directory.
           CURRENT="$GRADLE_ROOT"
 
           while [ "$CURRENT" != "/" ]; do
             if [ -f "$CURRENT/pubspec.yaml" ]; then
-              FLUTTER_ROOT="$CURRENT"
+              FLUTTER_PROJECT_ROOT="$CURRENT"
               break
             fi
 
             CURRENT="$(dirname "$CURRENT")"
           done
 
-          # Fallback for ZIPs containing nested Flutter projects.
-          if [ -z "$FLUTTER_ROOT" ]; then
+          if [ -z "$FLUTTER_PROJECT_ROOT" ]; then
             FOUND="$(
               find "$EXTRACT_DIR" -maxdepth 7 \
                 -type f -name "pubspec.yaml" \
@@ -452,14 +449,14 @@ jobs:
             )"
 
             if [ -n "$FOUND" ]; then
-              FLUTTER_ROOT="$(dirname "$FOUND")"
+              FLUTTER_PROJECT_ROOT="$(dirname "$FOUND")"
             fi
           fi
 
-          if [ -n "$FLUTTER_ROOT" ]; then
+          if [ -n "$FLUTTER_PROJECT_ROOT" ]; then
             echo "is_flutter=true" >> "$GITHUB_OUTPUT"
-            echo "flutter_root=$FLUTTER_ROOT" >> "$GITHUB_OUTPUT"
-            echo "Flutter project ditemukan: $FLUTTER_ROOT"
+            echo "flutter_root=$FLUTTER_PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+            echo "Flutter project ditemukan: $FLUTTER_PROJECT_ROOT"
           else
             echo "is_flutter=false" >> "$GITHUB_OUTPUT"
             echo "flutter_root=" >> "$GITHUB_OUTPUT"
@@ -572,12 +569,188 @@ jobs:
           echo "::endgroup::"
 
       # ============================================================
-      # GRADLE
+      # AUTO DETECT + AUTO SETUP COMPATIBLE GRADLE VERSION
+      # ============================================================
+      - name: Auto Detect Compatible Gradle
+        id: gradle_version
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        env:
+          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "::group::Auto Detect Gradle Version"
+
+          ROOT="$PWD"
+          WRAPPER_PROPERTIES="$ROOT/gradle/wrapper/gradle-wrapper.properties"
+
+          # Default for projects without a wrapper.
+          SELECTED_GRADLE="8.14.3"
+          REQUIRED_GRADLE="8.0"
+          AGP_VERSION=""
+
+          # Read the current wrapper version when available.
+          if [ -f "$WRAPPER_PROPERTIES" ]; then
+            CURRENT_URL="$(grep -E '^distributionUrl=' "$WRAPPER_PROPERTIES" | tail -n 1 || true)"
+
+            CURRENT_GRADLE="$(
+              printf '%s\n' "$CURRENT_URL" |
+              sed -nE 's#.*gradle-([0-9]+(\.[0-9]+){1,2})-(bin|all)\.zip.*#\1#p'
+            )"
+
+            if [ -n "$CURRENT_GRADLE" ]; then
+              SELECTED_GRADLE="$CURRENT_GRADLE"
+              echo "Gradle wrapper terdeteksi: $CURRENT_GRADLE"
+            else
+              echo "::notice::Versi Gradle tidak ditemukan pada wrapper; versi akan ditentukan otomatis."
+            fi
+          else
+            echo "Gradle wrapper properties belum ada."
+          fi
+
+          # Detect Android Gradle Plugin (AGP) declarations in common
+          # Groovy/Kotlin build scripts and version catalogs.
+          AGP_VERSION="$(
+            grep -RhoE \
+              'com\.android\.tools\.build:gradle:[0-9]+(\.[0-9]+){1,2}|com\.android\.application["'\'']?[[:space:]]*\)?[[:space:]]*version[[:space:]]*["'\''][0-9]+(\.[0-9]+){1,2}|com\.android\.library["'\'']?[[:space:]]*\)?[[:space:]]*version[[:space:]]*["'\''][0-9]+(\.[0-9]+){1,2}' \
+              "$ROOT" \
+              --include='*.gradle' \
+              --include='*.gradle.kts' \
+              --include='*.toml' \
+              --exclude-dir=.gradle \
+              --exclude-dir=build \
+              --exclude-dir=node_modules \
+              2>/dev/null |
+            grep -oE '[0-9]+(\.[0-9]+){1,2}$' |
+            sort -V |
+            tail -n 1 || true
+          )"
+
+          # Also support version-catalog aliases such as agp = "8.7.3".
+          if [ -z "$AGP_VERSION" ] && [ -f "$ROOT/gradle/libs.versions.toml" ]; then
+            AGP_VERSION="$(
+              sed -nE \
+                '/^[[:space:]]*\[versions\]/,/^[[:space:]]*\[/s/^[[:space:]]*(agp|androidGradlePlugin)[[:space:]]*=[[:space:]]*["'\'']([0-9]+(\.[0-9]+){1,2})["'\''].*/\2/p' \
+                "$ROOT/gradle/libs.versions.toml" |
+              head -n 1
+            )"
+          fi
+
+          if [ -n "$AGP_VERSION" ]; then
+            echo "Android Gradle Plugin terdeteksi: $AGP_VERSION"
+
+            AGP_MAJOR="$(echo "$AGP_VERSION" | cut -d. -f1)"
+            AGP_MINOR="$(echo "$AGP_VERSION" | cut -s -d. -f2)"
+            AGP_MINOR="${AGP_MINOR:-0}"
+
+            # Conservative minimum Gradle versions for common AGP releases.
+            if [ "$AGP_MAJOR" -ge 9 ]; then
+              REQUIRED_GRADLE="8.14.3"
+            elif [ "$AGP_MAJOR" -eq 8 ]; then
+              if [ "$AGP_MINOR" -ge 13 ]; then
+                REQUIRED_GRADLE="8.13"
+              elif [ "$AGP_MINOR" -ge 11 ]; then
+                REQUIRED_GRADLE="8.13"
+              elif [ "$AGP_MINOR" -ge 10 ]; then
+                REQUIRED_GRADLE="8.11.1"
+              elif [ "$AGP_MINOR" -ge 9 ]; then
+                REQUIRED_GRADLE="8.11.1"
+              elif [ "$AGP_MINOR" -ge 8 ]; then
+                REQUIRED_GRADLE="8.10.2"
+              elif [ "$AGP_MINOR" -ge 7 ]; then
+                REQUIRED_GRADLE="8.9"
+              elif [ "$AGP_MINOR" -ge 6 ]; then
+                REQUIRED_GRADLE="8.7"
+              elif [ "$AGP_MINOR" -ge 5 ]; then
+                REQUIRED_GRADLE="8.7"
+              elif [ "$AGP_MINOR" -ge 4 ]; then
+                REQUIRED_GRADLE="8.6"
+              elif [ "$AGP_MINOR" -ge 3 ]; then
+                REQUIRED_GRADLE="8.4"
+              elif [ "$AGP_MINOR" -ge 2 ]; then
+                REQUIRED_GRADLE="8.2"
+              elif [ "$AGP_MINOR" -ge 1 ]; then
+                REQUIRED_GRADLE="8.0"
+              else
+                REQUIRED_GRADLE="8.0"
+              fi
+            elif [ "$AGP_MAJOR" -eq 7 ]; then
+              REQUIRED_GRADLE="7.0"
+            else
+              REQUIRED_GRADLE="6.7"
+            fi
+          else
+            echo "::notice::AGP version tidak terdeteksi otomatis; memakai wrapper yang ada jika valid."
+          fi
+
+          # Flutter's Gradle plugin may require a newer Gradle version.
+          # Keep this floor aligned with the minimum reported by Flutter
+          # during dependency validation.
+          if [ "$IS_FLUTTER" = "true" ]; then
+            if [ "$(printf '%s\n' "$REQUIRED_GRADLE" "8.14.3" | sort -V | tail -n 1)" != "$REQUIRED_GRADLE" ]; then
+              REQUIRED_GRADLE="8.14.3"
+            fi
+          fi
+
+          # Compare numeric version strings safely with sort -V.
+          if [ "$(printf '%s\n' "$SELECTED_GRADLE" "$REQUIRED_GRADLE" | sort -V | tail -n 1)" != "$SELECTED_GRADLE" ]; then
+            echo "Versi Gradle $SELECTED_GRADLE terlalu lama."
+            echo "Minimum terdeteksi: $REQUIRED_GRADLE"
+            SELECTED_GRADLE="$REQUIRED_GRADLE"
+          else
+            echo "Gradle $SELECTED_GRADLE memenuhi minimum $REQUIRED_GRADLE."
+          fi
+
+          # Preserve the existing distribution type when possible.
+          DIST_TYPE="bin"
+
+          if [ -f "$WRAPPER_PROPERTIES" ] &&
+             grep -qE 'gradle-[^/]*-all\.zip' "$WRAPPER_PROPERTIES"; then
+            DIST_TYPE="all"
+          fi
+
+          mkdir -p "$(dirname "$WRAPPER_PROPERTIES")"
+
+          # Preserve all existing wrapper settings and replace only
+          # distributionUrl, or add it when missing.
+          if [ -f "$WRAPPER_PROPERTIES" ]; then
+            if grep -qE '^distributionUrl=' "$WRAPPER_PROPERTIES"; then
+              sed -i -E \
+                "s#^distributionUrl=.*#distributionUrl=https\\\\://services.gradle.org/distributions/gradle-${SELECTED_GRADLE}-${DIST_TYPE}.zip#" \
+                "$WRAPPER_PROPERTIES"
+            else
+              printf '\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-%s-%s.zip\n' \
+                "$SELECTED_GRADLE" "$DIST_TYPE" >> "$WRAPPER_PROPERTIES"
+            fi
+          else
+            printf 'distributionBase=GRADLE_USER_HOME\n' > "$WRAPPER_PROPERTIES"
+            printf 'distributionPath=wrapper/dists\n' >> "$WRAPPER_PROPERTIES"
+            printf 'zipStoreBase=GRADLE_USER_HOME\n' >> "$WRAPPER_PROPERTIES"
+            printf 'zipStorePath=wrapper/dists\n' >> "$WRAPPER_PROPERTIES"
+            printf 'distributionUrl=https\\://services.gradle.org/distributions/gradle-%s-%s.zip\n' \
+              "$SELECTED_GRADLE" "$DIST_TYPE" >> "$WRAPPER_PROPERTIES"
+          fi
+
+          echo "Gradle terpilih: $SELECTED_GRADLE"
+          echo "Minimum terdeteksi: $REQUIRED_GRADLE"
+          echo "Distribusi: $DIST_TYPE"
+          echo "Wrapper properties:"
+          cat "$WRAPPER_PROPERTIES"
+
+          echo "version=$SELECTED_GRADLE" >> "$GITHUB_OUTPUT"
+          echo "required_version=$REQUIRED_GRADLE" >> "$GITHUB_OUTPUT"
+          echo "agp_version=${AGP_VERSION:-unknown}" >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+      # ============================================================
+      # SETUP GRADLE — USE THE AUTO-DETECTED VERSION
       # ============================================================
       - name: Setup Gradle
         uses: gradle/gradle-build-action@v3
         with:
-          gradle-version: '8.2'
+          gradle-version: ${{ steps.gradle_version.outputs.version }}
 
       # ============================================================
       # AUTO-GENERATE MISSING ICONS
@@ -679,6 +852,8 @@ jobs:
       - name: Prepare Gradle Wrapper
         working-directory: ${{ steps.detect.outputs.root }}
         shell: bash
+        env:
+          DETECTED_GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
         run: |
           set -Eeuo pipefail
 
@@ -688,11 +863,17 @@ jobs:
 
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] ||
              [ ! -f "gradlew" ]; then
-            echo "Gradle wrapper belum lengkap; membuat wrapper Gradle 8.2."
-            gradle wrapper --gradle-version 8.2 --distribution-type bin
+            echo "Gradle wrapper belum lengkap; membuat wrapper Gradle $DETECTED_GRADLE_VERSION."
+            gradle wrapper \
+              --gradle-version "$DETECTED_GRADLE_VERSION" \
+              --distribution-type bin
           fi
 
           chmod +x gradlew
+
+          echo "Versi wrapper:"
+          grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties || true
+
           echo "Gradle wrapper siap."
           echo "::endgroup::"
 
@@ -799,6 +980,8 @@ jobs:
             FINAL_TASK="$TASK"
           fi
 
+          echo "Auto-detected Gradle: ${{ steps.gradle_version.outputs.version }}"
+          echo "Detected AGP: ${{ steps.gradle_version.outputs.agp_version }}"
           echo "Running: ./gradlew $FINAL_TASK"
 
           set +e
@@ -938,6 +1121,9 @@ jobs:
             echo "Project Root: ${{ steps.detect.outputs.root }}"
             echo "Flutter Project: ${{ steps.flutter_detect.outputs.is_flutter }}"
             echo "Flutter Root: ${{ steps.flutter_detect.outputs.flutter_root }}"
+            echo "Gradle Version: ${{ steps.gradle_version.outputs.version }}"
+            echo "Required Gradle: ${{ steps.gradle_version.outputs.required_version }}"
+            echo "AGP Version: ${{ steps.gradle_version.outputs.agp_version }}"
             echo "Commit: ${{ github.sha }}"
             echo "Actor: ${{ github.actor }}"
             echo "Finished: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -1014,5 +1200,8 @@ jobs:
             echo "| Flavor | ${{ github.event.inputs.build_flavor }} |"
             echo "| Java | ${{ github.event.inputs.java_version }} |"
             echo "| Flutter Project | ${{ steps.flutter_detect.outputs.is_flutter }} |"
+            echo "| Gradle Version | ${{ steps.gradle_version.outputs.version }} |"
+            echo "| Required Gradle | ${{ steps.gradle_version.outputs.required_version }} |"
+            echo "| AGP Version | ${{ steps.gradle_version.outputs.agp_version }} |"
             echo "| Status | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
