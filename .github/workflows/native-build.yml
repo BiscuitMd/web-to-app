@@ -3,9 +3,15 @@ name: Native Build
 on:
   workflow_dispatch:
     inputs:
+      # ────── BARU: Hybrid mode (ZIP besar via GitHub Release) ──────
+      base_zip_url:
+        description: 'URL ZIP di GitHub Release (dari bot hybrid)'
+        required: false
+        default: ''
+        type: string
       # ────── Input dari bot (github.js) ──────
       base_zip_path:
-        description: 'Path ZIP di repo (dari bot)'
+        description: 'Path ZIP di repo (dari bot — Contents API, <1MB)'
         required: false
         default: ''
         type: string
@@ -90,12 +96,21 @@ jobs:
           fetch-depth: 1
 
       # ════════════════════════════════════════════════════════════
-      # RESOLVE SOURCE — prioritas: base_zip_path > project_path > target_dir/zip_file > root
+      # RESOLVE SOURCE
+      # Prioritas:
+      #   1. base_zip_url    (BARU — hybrid, GitHub Release, sampai 2 GB)
+      #   2. base_zip_path   (lama — Contents API, <1 MB)
+      #   3. project_path    (folder / zip)
+      #   4. target_dir/zip_file
+      #   5. root repo
+      #   6. build-inputs/native (fallback lama)
       # ════════════════════════════════════════════════════════════
       - name: Resolve Project Source
         id: resolve
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_BASE_ZIP_URL: ${{ inputs.base_zip_url }}
           IN_BASE_ZIP: ${{ inputs.base_zip_path }}
           IN_PROJECT_PATH: ${{ inputs.project_path }}
           IN_TARGET_DIR: ${{ inputs.target_dir }}
@@ -104,6 +119,7 @@ jobs:
           set -Eeuo pipefail
           echo "::group::Resolve Project Source"
 
+          BASE_ZIP_URL="${IN_BASE_ZIP_URL:-}"
           BASE_ZIP="${IN_BASE_ZIP:-}"
           PROJECT_PATH="${IN_PROJECT_PATH:-}"
           TARGET_DIR="${IN_TARGET_DIR:-}"
@@ -113,7 +129,37 @@ jobs:
           rm -rf "$WORK_DIR"
           mkdir -p "$WORK_DIR"
 
-          # ── 1. base_zip_path dari bot ──
+          # ── 0. BARU: base_zip_url dari GitHub Release (hybrid) ──
+          if [ -n "$BASE_ZIP_URL" ]; then
+            echo "✓ Mode: BOT-URL (hybrid — download dari Release)"
+            echo "   URL: $BASE_ZIP_URL"
+
+            curl -L -f --retry 3 --retry-delay 5 \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "$WORK_DIR/input.zip" \
+              "$BASE_ZIP_URL"
+
+            unzip -o "$WORK_DIR/input.zip" -d "$WORK_DIR" >/dev/null
+            rm -f "$WORK_DIR/input.zip"
+            echo "   ✓ Extract selesai"
+
+            # Flatten kalau cuma 1 subfolder
+            SUBDIRS=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
+            FILES=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type f | wc -l)
+            if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+              INNER=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d)
+              mv "$INNER"/* "$WORK_DIR"/ 2>/dev/null || true
+              rmdir "$INNER" 2>/dev/null || true
+              echo "   ✓ Flatten subfolder"
+            fi
+
+            echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+            echo "mode=extract" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 1. base_zip_path dari bot (lama) ──
           if [ -n "$BASE_ZIP" ] && [ -f "$BASE_ZIP" ]; then
             echo "✓ Mode: BOT-ZIP ($BASE_ZIP)"
             unzip -o "$BASE_ZIP" -d "$WORK_DIR" >/dev/null
@@ -177,6 +223,7 @@ jobs:
           fi
 
           echo "::error::Source project tidak ditemukan."
+          echo "base_zip_url='$BASE_ZIP_URL'"
           echo "base_zip_path='$BASE_ZIP'"
           echo "project_path='$PROJECT_PATH'"
           echo "target_dir='$TARGET_DIR' zip_file='$ZIP_FILE'"
@@ -420,7 +467,8 @@ jobs:
             echo "Job ID: $GITHUB_RUN_ID"
             echo "Server: ${{ inputs.server }}"
             echo "Build Mode: ${{ inputs.build_mode }}"
-            echo "Base ZIP: ${{ inputs.base_zip_path }}"
+            echo "Base ZIP URL: ${{ inputs.base_zip_url }}"
+            echo "Base ZIP Path: ${{ inputs.base_zip_path }}"
             echo "User ID: ${{ inputs.user_id }}"
             echo "Username: ${{ inputs.username }}"
             echo "Resolve Mode: ${{ steps.resolve.outputs.mode }}"
@@ -478,7 +526,9 @@ jobs:
             echo "| Job ID | $GITHUB_RUN_ID |"
             echo "| Server | ${{ inputs.server }} |"
             echo "| Mode | ${{ inputs.build_mode }} |"
-            echo "| Base ZIP | ${{ inputs.base_zip_path }} |"
+            echo "| Source | ${{ inputs.base_zip_url != '' && 'GitHub Release' || inputs.base_zip_path != '' && 'Repo Contents' || inputs.project_path != '' && 'Project Path' || 'Auto' }} |"
+            echo "| Base ZIP URL | ${{ inputs.base_zip_url }} |"
+            echo "| Base ZIP Path | ${{ inputs.base_zip_path }} |"
             echo "| Resolve | ${{ steps.resolve.outputs.mode }} |"
             echo "| User | ${{ inputs.user_id }} |"
             echo "| Status | ${{ job.status }} |"
