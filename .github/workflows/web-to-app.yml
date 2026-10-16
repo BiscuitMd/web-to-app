@@ -1,91 +1,647 @@
-name: Web To App
+name: Web To App Builder
+
 on:
   workflow_dispatch:
     inputs:
-      server:
-        description: Logical build slot
-        required: true
-        type: choice
-        options: ["1","2","3","4","5"]
+      # ═══ INPUT DARI BOT (handlers.js) ═══
       website_url:
-        description: Public website URL
-        required: true
-        type: string
-      app_name:
-        description: Android application display name
-        required: true
-        type: string
-      build_mode:
-        description: Build mode
-        required: true
-        type: choice
-        options: ["release","debug"]
-      project_path:
-        description: WebView wrapper Android project path in repository
-        required: true
-        default: "templates/webview-android"
-      user_id:
+        description: 'URL website (dari bot)'
         required: false
+        type: string
+      server:
+        description: 'Server metadata dari bot'
+        required: false
+        default: ''
+        type: string
+      project_path:
+        description: 'Path project dari bot (diabaikan, workflow generate sendiri)'
+        required: false
+        default: ''
+        type: string
+      user_id:
+        description: 'Telegram user ID (metadata)'
+        required: false
+        default: ''
         type: string
       username:
+        description: 'Telegram username (metadata)'
         required: false
+        default: ''
         type: string
       user_name:
+        description: 'Nama user Telegram (metadata)'
+        required: false
+        default: ''
+        type: string
+
+      # ═══ INPUT LAMA (JANGAN DIHAPUS) ═══
+      target_dir:
+        description: 'Target directory (mode lama: config sudah ada di repo)'
         required: false
         type: string
-permissions:
-  contents: read
-concurrency:
-  group: webapp-${{ inputs.server }}
-  cancel-in-progress: false
+      config_file:
+        description: 'Nama file config'
+        required: false
+        default: 'config.json'
+        type: string
+      app_name:
+        description: 'Nama aplikasi'
+        required: false
+        type: string
+      app_url:
+        description: 'URL web (mode lama)'
+        required: false
+        type: string
+      icon_file:
+        description: 'Nama file icon (mode lama)'
+        required: false
+        default: 'icon.png'
+        type: string
+      build_type:
+        description: 'debug / release'
+        required: false
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      orientation:
+        description: 'portrait / landscape'
+        required: false
+        default: 'portrait'
+        type: choice
+        options:
+          - portrait
+          - landscape
+
+      # ═══ INPUT BARU (MODE URL — DARI CODE BOT) ═══
+      web_url:
+        description: 'URL website (alias dari website_url)'
+        required: false
+        type: string
+      app_label:
+        description: 'Label app (mode baru, dengan spasi)'
+        required: false
+        type: string
+      icon_url:
+        description: 'URL icon (mode baru, opsional)'
+        required: false
+        type: string
+      build_mode:
+        description: 'debug / release (mode baru, dari bot)'
+        required: false
+        type: string
+      job_id:
+        description: 'Job ID (mode baru)'
+        required: false
+        type: string
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-      - uses: android-actions/setup-android@v3
-      - name: Configure WebView wrapper
+          fetch-depth: 1
+
+      # ═══════════════════════════════════════════
+      # 🔥 DETECT MODE + AUTO PREPARE
+      # ═══════════════════════════════════════════
+      - name: Detect Mode & Prepare Files
+        id: prep
         shell: bash
         run: |
-          set -euo pipefail
-          test -f "${{ inputs.project_path }}/gradlew"
-          python3 - <<'PY'
-          import os, re
-          url = os.environ["SITE_URL"]
-          name = os.environ["APP_NAME"]
-          if not re.match(r'^https?://', url): raise SystemExit("URL must start with http:// or https://")
-          if len(name) > 40: raise SystemExit("App name must be 40 characters or less")
-          p = os.path.join(os.environ["PROJECT_PATH"], "app/src/main/res/values/strings.xml")
-          if os.path.exists(p):
-            text = open(p, encoding="utf-8").read()
-            text = re.sub(r'(<string name="app_name">).*?(</string>)', lambda m: m.group(1)+name.replace("&","&amp;").replace("<","&lt;")+m.group(2), text)
-            open(p,"w",encoding="utf-8").write(text)
-          java = os.path.join(os.environ["PROJECT_PATH"], "app/src/main/java/com/example/webapp/MainActivity.kt")
-          if os.path.exists(java):
-            text = open(java, encoding="utf-8").read().replace("https://example.com", url)
-            open(java,"w",encoding="utf-8").write(text)
-          PY
-        env:
-          SITE_URL: ${{ inputs.website_url }}
-          APP_NAME: ${{ inputs.app_name }}
-          PROJECT_PATH: ${{ inputs.project_path }}
+          set -Eeuo pipefail
+
+          # ═══ BACA SEMUA INPUT ═══
+          TARGET_DIR="${{ inputs.target_dir }}"
+          WEBSITE_URL="${{ inputs.website_url }}"
+          WEB_URL="${{ inputs.web_url }}"
+          APP_NAME="${{ inputs.app_name }}"
+          APP_LABEL="${{ inputs.app_label }}"
+          APP_URL_OLD="${{ inputs.app_url }}"
+          ICON_FILE="${{ inputs.icon_file }}"
+          ICON_URL="${{ inputs.icon_url }}"
+          BUILD_TYPE="${{ inputs.build_type }}"
+          BUILD_MODE="${{ inputs.build_mode }}"
+          ORIENTATION="${{ inputs.orientation }}"
+          JOB_ID="${{ inputs.job_id }}"
+          CONFIG_FILE="${{ inputs.config_file }}"
+          [ -n "$CONFIG_FILE" ] || CONFIG_FILE="config.json"
+
+          # ═══ NORMALISASI: website_url (dari bot) ATAU web_url (lama) ═══
+          EFFECTIVE_URL=""
+          if [ -n "$WEBSITE_URL" ]; then
+            EFFECTIVE_URL="$WEBSITE_URL"
+            echo "✓ Menggunakan website_url dari bot: $EFFECTIVE_URL"
+          elif [ -n "$WEB_URL" ]; then
+            EFFECTIVE_URL="$WEB_URL"
+            echo "✓ Menggunakan web_url: $EFFECTIVE_URL"
+          elif [ -n "$APP_URL_OLD" ]; then
+            EFFECTIVE_URL="$APP_URL_OLD"
+            echo "✓ Menggunakan app_url (mode lama): $EFFECTIVE_URL"
+          fi
+
+          # ═══ TENTUKAN MODE ═══
+          MODE=""
+          if [ -n "$EFFECTIVE_URL" ] && { [ -n "$WEBSITE_URL" ] || [ -n "$WEB_URL" ]; }; then
+            MODE="url"
+          elif [ -n "$TARGET_DIR" ] && [ -n "$APP_URL_OLD" ]; then
+            MODE="dir"
+          elif [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
+            MODE="dir"
+          elif [ -n "$EFFECTIVE_URL" ]; then
+            MODE="url"
+          else
+            echo "::error::Tidak bisa detect mode. Kirim (target_dir + app_url) atau (website_url/web_url + app_name)."
+            echo "target_dir='$TARGET_DIR'"
+            echo "website_url='$WEBSITE_URL'"
+            echo "web_url='$WEB_URL'"
+            echo "app_url='$APP_URL_OLD'"
+            echo "app_name='$APP_NAME'"
+            exit 1
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "✓ Mode: $MODE"
+
+          # ═══ DEFAULT APP_NAME kalau kosong ═══
+          if [ -z "$APP_NAME" ]; then
+            if [ -n "$APP_LABEL" ]; then
+              APP_NAME="$APP_LABEL"
+            else
+              APP_NAME="Web App"
+            fi
+            echo "⚠️ app_name kosong, pakai default: $APP_NAME"
+          fi
+
+          # ═══ PREPARE (kalau mode URL) ═══
+          if [ "$MODE" = "url" ]; then
+            [ -n "$EFFECTIVE_URL" ] || { echo "::error::URL wajib di mode URL"; exit 1; }
+
+            # Pilih nama folder: pakai job_id kalau ada, else timestamp
+            if [ -z "$TARGET_DIR" ]; then
+              if [ -n "$JOB_ID" ]; then
+                TARGET_DIR="uploads/$JOB_ID"
+              else
+                TARGET_DIR="uploads/web2app_$(date +%s)"
+              fi
+            fi
+
+            mkdir -p "$TARGET_DIR"
+            echo "✓ Created target dir: $TARGET_DIR"
+
+            # Generate config.json
+            DISPLAY_NAME="${APP_LABEL:-$APP_NAME}"
+            cat > "$TARGET_DIR/$CONFIG_FILE" << EOF
+          {
+            "app_name": "$DISPLAY_NAME",
+            "app_url": "$EFFECTIVE_URL",
+            "orientation": "${ORIENTATION:-portrait}"
+          }
+          EOF
+            echo "✓ Generated $TARGET_DIR/$CONFIG_FILE"
+
+            # Download icon
+            if [ -n "$ICON_URL" ]; then
+              echo "Downloading icon from: $ICON_URL"
+              curl -sSL --max-time 30 "$ICON_URL" -o "$TARGET_DIR/$ICON_FILE" || true
+            fi
+
+            # Kalau icon gagal / ga ada → pakai default 1x1 PNG
+            if [ ! -f "$TARGET_DIR/$ICON_FILE" ] || [ ! -s "$TARGET_DIR/$ICON_FILE" ]; then
+              echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" | base64 -d > "$TARGET_DIR/$ICON_FILE"
+              echo "✓ Using default icon"
+            else
+              echo "✓ Icon downloaded: $(ls -lh $TARGET_DIR/$ICON_FILE | awk '{print $5}')"
+            fi
+
+            # Override build_type dari build_mode kalau ada
+            if [ -n "$BUILD_MODE" ]; then
+              BUILD_TYPE="$BUILD_MODE"
+            fi
+          fi
+
+          # ═══ VALIDASI TARGET DIR (semua mode) ═══
+          [ -n "$TARGET_DIR" ] || { echo "::error::target_dir kosong"; exit 1; }
+          [ -d "$TARGET_DIR" ] || { echo "::error::Target tidak ada: $TARGET_DIR"; exit 1; }
+          [ -f "$TARGET_DIR/$CONFIG_FILE" ] || { echo "::error::Config tidak ada: $TARGET_DIR/$CONFIG_FILE"; exit 1; }
+
+          # Export ke env biar step lain bisa pakai
+          echo "TARGET=$TARGET_DIR" >> $GITHUB_ENV
+          echo "CONFIG_FILE=$CONFIG_FILE" >> $GITHUB_ENV
+          echo "ICON_FILE=$ICON_FILE" >> $GITHUB_ENV
+          echo "BUILD_TYPE_FINAL=${BUILD_TYPE:-debug}" >> $GITHUB_ENV
+          echo "ORIENTATION_FINAL=${ORIENTATION:-portrait}" >> $GITHUB_ENV
+          echo "APP_NAME_FINAL=$APP_NAME" >> $GITHUB_ENV
+          echo "APP_URL_FINAL=$EFFECTIVE_URL" >> $GITHUB_ENV
+
+          echo "✓ Final TARGET: $TARGET_DIR"
+          echo "✓ Final BUILD_TYPE: ${BUILD_TYPE:-debug}"
+          echo "✓ Final APP_NAME: $APP_NAME"
+          echo "✓ Final APP_URL: $EFFECTIVE_URL"
+
+      - name: Show Config
+        run: cat "${{ env.TARGET }}/${{ env.CONFIG_FILE }}"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        shell: bash
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk
+
+          echo "Downloading cmdline-tools..."
+          curl -sSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d cmdline-tools-tmp
+          mv cmdline-tools-tmp/cmdline-tools cmdline-tools/latest
+          rm -rf cmdline-tools-tmp cmdline-tools.zip
+
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+
+      - name: Accept Licenses & Install Packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install ImageMagick
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+
+      - name: Prepare Icon (Convert to Real PNG)
+        id: prep_icon
+        shell: bash
+        run: |
+          TARGET="${{ env.TARGET }}"
+          ICON_FILE="${{ env.ICON_FILE }}"
+          ICON_IN="$TARGET/$ICON_FILE"
+
+          if [ ! -f "$ICON_IN" ]; then
+            echo "::error::Icon tidak ditemukan: $ICON_IN"
+            exit 1
+          fi
+
+          echo "Original icon info:"
+          file "$ICON_IN"
+          ls -la "$ICON_IN"
+
+          ICON_OUT="$TARGET/icon_fixed.png"
+
+          echo "Converting to real PNG..."
+          convert "$ICON_IN" -resize 512x512^ -gravity center -extent 512x512 \
+            -define png:color-type=6 -strip "$ICON_OUT" || \
+          magick "$ICON_IN" -resize 512x512^ -gravity center -extent 512x512 \
+            -define png:color-type=6 -strip "$ICON_OUT"
+
+          if [ ! -f "$ICON_OUT" ]; then
+            echo "::error::Convert icon gagal"
+            exit 1
+          fi
+
+          echo "Fixed icon info:"
+          file "$ICON_OUT"
+          ls -la "$ICON_OUT"
+
+          echo "icon_path=$ICON_OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Create Project
+        id: create
+        shell: bash
+        run: |
+          PROJECT_DIR="${{ env.TARGET }}/app_project"
+          mkdir -p "$PROJECT_DIR/app/src/main/java/com/spartax/webtoapp"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/layout"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/values"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/mipmap-hdpi"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/mipmap-mdpi"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/mipmap-xhdpi"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/mipmap-xxhdpi"
+          mkdir -p "$PROJECT_DIR/app/src/main/res/mipmap-xxxhdpi"
+          mkdir -p "$PROJECT_DIR/gradle/wrapper"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Write settings.gradle
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/settings.gradle" << 'EOF'
+          rootProject.name = "WebToApp"
+          include ':app'
+          EOF
+
+      - name: Write build.gradle
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/build.gradle" << 'EOF'
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }
+          }
+          allprojects {
+              repositories { google(); mavenCentral() }
+          }
+          EOF
+
+      - name: Write gradle.properties
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/gradle.properties" << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+      - name: Write gradle-wrapper.properties
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/gradle/wrapper/gradle-wrapper.properties" << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.2-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+      - name: Write app/build.gradle
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/app/build.gradle" << 'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.spartax.webtoapp'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.spartax.webtoapp"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release { minifyEnabled false; signingConfig signingConfigs.debug }
+                  debug { minifyEnabled false }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.webkit:webkit:1.10.0'
+          }
+          EOF
+
+      - name: Write AndroidManifest.xml
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          ORIENTATION="${{ env.ORIENTATION_FINAL }}"
+          if [ "$ORIENTATION" = "portrait" ]; then
+            SCREEN="portrait"
+          else
+            SCREEN="landscape"
+          fi
+
+          cat > "$DIR/app/src/main/AndroidManifest.xml" << EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="${SCREEN}"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Write MainActivity.java
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/app/src/main/java/com/spartax/webtoapp/MainActivity.java" << 'EOF'
+          package com.spartax.webtoapp;
+
+          import android.annotation.SuppressLint;
+          import android.os.Bundle;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import android.view.KeyEvent;
+          import androidx.appcompat.app.AppCompatActivity;
+
+          public class MainActivity extends AppCompatActivity {
+              private WebView webView;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  webView = findViewById(R.id.webview);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setLoadWithOverviewMode(true);
+                  settings.setUseWideViewPort(true);
+                  settings.setBuiltInZoomControls(true);
+                  settings.setDisplayZoomControls(false);
+                  settings.setSupportZoom(true);
+                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+
+                  String url = getString(R.string.app_url);
+                  webView.loadUrl(url);
+              }
+
+              @Override
+              public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+                      webView.goBack();
+                      return true;
+                  }
+                  return super.onKeyDown(keyCode, event);
+              }
+          }
+          EOF
+
+      - name: Write activity_main.xml
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cat > "$DIR/app/src/main/res/layout/activity_main.xml" << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+              <WebView
+                  android:id="@+id/webview"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent" />
+          </RelativeLayout>
+          EOF
+
+      # ═══ WRITE strings.xml — support 2 MODE ═══
+      - name: Write strings.xml
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          TARGET="${{ env.TARGET }}"
+          CONFIG_FILE="${{ env.CONFIG_FILE }}"
+
+          # Coba baca dari config.json dulu (mode URL & mode dir yang punya config)
+          APP_NAME_FINAL=""
+          APP_URL_FINAL=""
+
+          if [ -f "$TARGET/$CONFIG_FILE" ]; then
+            APP_NAME_FINAL=$(python3 -c "import json; print(json.load(open('$TARGET/$CONFIG_FILE')).get('app_name',''))" 2>/dev/null || echo "")
+            APP_URL_FINAL=$(python3 -c "import json; print(json.load(open('$TARGET/$CONFIG_FILE')).get('app_url',''))" 2>/dev/null || echo "")
+          fi
+
+          # Fallback ke input workflow kalau config kosong
+          [ -z "$APP_NAME_FINAL" ] && APP_NAME_FINAL="${{ env.APP_NAME_FINAL }}"
+          [ -z "$APP_URL_FINAL" ] && APP_URL_FINAL="${{ env.APP_URL_FINAL }}"
+
+          echo "APP_NAME_FINAL=$APP_NAME_FINAL"
+          echo "APP_URL_FINAL=$APP_URL_FINAL"
+
+          # Escape XML entities sederhana
+          APP_NAME_XML=$(printf '%s' "$APP_NAME_FINAL" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          APP_URL_XML=$(printf '%s' "$APP_URL_FINAL" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+          cat > "$DIR/app/src/main/res/values/strings.xml" << EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">${APP_NAME_XML}</string>
+              <string name="app_url">${APP_URL_XML}</string>
+          </resources>
+          EOF
+
+      - name: Copy Fixed Icon (Resize per Density)
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          ICON_FIXED="${{ steps.prep_icon.outputs.icon_path }}"
+
+          convert "$ICON_FIXED" -resize 48x48   "$DIR/app/src/main/res/mipmap-mdpi/ic_launcher.png"
+          convert "$ICON_FIXED" -resize 72x72   "$DIR/app/src/main/res/mipmap-hdpi/ic_launcher.png"
+          convert "$ICON_FIXED" -resize 96x96   "$DIR/app/src/main/res/mipmap-xhdpi/ic_launcher.png"
+          convert "$ICON_FIXED" -resize 144x144 "$DIR/app/src/main/res/mipmap-xxhdpi/ic_launcher.png"
+          convert "$ICON_FIXED" -resize 192x192 "$DIR/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            f="$DIR/app/src/main/res/mipmap-$d/ic_launcher.png"
+            echo "$d: $(file $f)"
+          done
+          echo "✓ All icons converted to real PNG"
+
+      - name: Download gradlew
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          cd "$DIR"
+          curl -sSL "https://raw.githubusercontent.com/gradle/gradle/v8.2.0/gradlew" -o gradlew
+          curl -sSL "https://raw.githubusercontent.com/gradle/gradle/v8.2.0/gradle/wrapper/gradle-wrapper.jar" -o gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+
       - name: Build APK
+        working-directory: ${{ steps.create.outputs.dir }}
         shell: bash
         run: |
-          set -euo pipefail
-          cd "${{ inputs.project_path }}"
-          if [ "${{ inputs.build_mode }}" = "release" ]; then ./gradlew assembleRelease --stacktrace; else ./gradlew assembleDebug --stacktrace; fi
-      - uses: actions/upload-artifact@v4
-        if: always()
+          BUILD_TYPE="${{ env.BUILD_TYPE_FINAL }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Locate APK
+        id: locate
+        shell: bash
+        run: |
+          DIR="${{ steps.create.outputs.dir }}"
+          BUILD_TYPE="${{ env.BUILD_TYPE_FINAL }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            APK=$(find "$DIR/app/build/outputs/apk/release" -name "*.apk" 2>/dev/null | head -n 1)
+          else
+            APK=$(find "$DIR/app/build/outputs/apk/debug" -name "*.apk" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan"
+            find "$DIR/app/build" -name "*.apk" 2>/dev/null || true
+            exit 1
+          fi
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "✓ APK: $APK"
+          echo "✓ Size: $(ls -lh $APK | awk '{print $5}')"
+
+      - name: Upload APK
+        if: ${{ steps.locate.outputs.apk != '' }}
+        uses: actions/upload-artifact@v4
         with:
-          name: webapp-${{ inputs.build_mode }}-server-${{ inputs.server }}
-          path: |
-            ${{ inputs.project_path }}/**/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
+          name: web-to-app-apk
+          path: ${{ steps.locate.outputs.apk }}
           retention-days: 7
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Web to App Build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Mode | ${{ steps.prep.outputs.mode }} |"
+            echo "| Target | ${{ env.TARGET }} |"
+            echo "| App Name | ${{ env.APP_NAME_FINAL }} |"
+            echo "| URL | ${{ env.APP_URL_FINAL }} |"
+            echo "| Build Mode | ${{ env.BUILD_TYPE_FINAL }} |"
+            echo "| Server | ${{ inputs.server }} |"
+            echo "| User ID | ${{ inputs.user_id }} |"
+            echo "| Status | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
