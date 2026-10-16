@@ -1,47 +1,47 @@
-
 name: Native Build
 
 on:
   workflow_dispatch:
     inputs:
       target_dir:
-        description: "Target directory (folder tempat ZIP)"
+        description: 'Target directory (folder tempat zip)'
         required: false
-        default: "."
+        default: '.'
         type: string
+      # Compatibility inputs used by the Telegram bot script
       server:
-        description: "Metadata server dari bot (opsional)"
+        description: 'Metadata server dari bot (opsional)'
         required: false
         type: string
       build_mode:
-        description: "Mode build dari bot (opsional)"
+        description: 'Mode build dari bot (opsional)'
         required: false
         type: string
       project_path:
-        description: "Path project atau ZIP dari bot (opsional)"
+        description: 'Path project atau ZIP dari bot (opsional)'
         required: false
         type: string
       user_id:
-        description: "Telegram user ID (metadata)"
+        description: 'Telegram user ID (metadata)'
         required: false
         type: string
       username:
-        description: "Telegram username (metadata)"
+        description: 'Telegram username (metadata)'
         required: false
         type: string
       user_name:
-        description: "Nama user Telegram (metadata)"
+        description: 'Nama user Telegram (metadata)'
         required: false
         type: string
       zip_file:
-        description: "Nama file ZIP project"
+        description: 'Nama file zip project'
         required: false
-        default: "project.zip"
+        default: 'project.zip'
         type: string
       build_task:
-        description: "Gradle task"
+        description: 'Gradle task'
         required: false
-        default: "assembleRelease"
+        default: 'assembleRelease'
         type: choice
         options:
           - assembleRelease
@@ -49,22 +49,15 @@ on:
           - bundleRelease
           - bundleDebug
       build_flavor:
-        description: "Product flavor (kosongkan kalau tidak ada)"
+        description: 'Product flavor (kosongkan kalau tidak ada)'
         required: false
-        default: ""
+        default: ''
         type: string
       java_version:
-        description: "Versi Java"
+        description: 'Versi Java'
         required: false
-        default: "17"
+        default: '17'
         type: string
-
-permissions:
-  contents: read
-
-concurrency:
-  group: native-build-${{ github.ref }}-${{ github.run_id }}
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -77,257 +70,158 @@ jobs:
         with:
           fetch-depth: 1
 
-      # ============================================================
-      # VALIDATE INPUT + FIND ZIP
-      # ============================================================
       - name: Validate Target Directory
         id: validate
-        shell: bash
-        env:
-          INPUT_TARGET_DIR: ${{ inputs.target_dir }}
-          INPUT_ZIP_FILE: ${{ inputs.zip_file }}
-          INPUT_PROJECT_PATH: ${{ inputs.project_path }}
         run: |
-          set -Eeuo pipefail
+          echo "::group::Validate"
+          TARGET="${{ github.event.inputs.target_dir }}"
+          ZIP="${{ github.event.inputs.zip_file }}"
+          PROJECT_PATH="${{ github.event.inputs.project_path }}"
 
-          TARGET="${INPUT_TARGET_DIR:-.}"
-          ZIP="${INPUT_ZIP_FILE:-project.zip}"
-          PROJECT_PATH="${INPUT_PROJECT_PATH:-}"
-
-          [ -n "$TARGET" ] || TARGET="."
-          [ -n "$ZIP" ] || ZIP="project.zip"
-
-          if [ -n "$PROJECT_PATH" ] &&
-             [ -f "$PROJECT_PATH" ] &&
-             [[ "$PROJECT_PATH" == *.zip ]]; then
-            TARGET="$(dirname "$PROJECT_PATH")"
-            ZIP="$(basename "$PROJECT_PATH")"
-
-          elif [ -n "$PROJECT_PATH" ] &&
-               [ -d "$PROJECT_PATH" ] &&
-               [ "$PROJECT_PATH" != "." ] &&
-               {
-                 [ -f "$PROJECT_PATH/settings.gradle" ] ||
-                 [ -f "$PROJECT_PATH/settings.gradle.kts" ] ||
-                 [ -f "$PROJECT_PATH/gradlew" ] ||
-                 [ -f "$PROJECT_PATH/build.gradle" ] ||
-                 [ -f "$PROJECT_PATH/build.gradle.kts" ];
-               }; then
-            mkdir -p "$RUNNER_TEMP/native-input"
-            (
-              cd "$PROJECT_PATH"
-              zip -qr "$RUNNER_TEMP/native-input/project-input.zip" . \
-                -x '.git/*' '*/.git/*' 'build/*' '*/build/*' \
-                   '.gradle/*' '*/.gradle/*' '*/node_modules/*'
-            )
-            TARGET="$RUNNER_TEMP/native-input"
-            ZIP="project-input.zip"
-          fi
-
-          ZIP_PATH=""
-
-          if [ -f "$TARGET/$ZIP" ]; then
-            ZIP_PATH="$TARGET/$ZIP"
-          elif [ -f "$ZIP" ]; then
-            ZIP_PATH="$ZIP"
-          elif [[ "$ZIP" == /* ]] && [ -f "$ZIP" ]; then
-            ZIP_PATH="$ZIP"
-          fi
-
-          if [ -z "$ZIP_PATH" ]; then
-            for DIR in "$TARGET" build-inputs build-inputs/flutter; do
-              if [ -d "$DIR" ] && [ -f "$DIR/$ZIP" ]; then
-                ZIP_PATH="$DIR/$ZIP"
-                break
+          # Bot compatibility: project_path may point to a ZIP or a folder.
+          if [ -n "$PROJECT_PATH" ]; then
+            if [ -f "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
+              TARGET="$(dirname "$PROJECT_PATH")"
+              ZIP="$(basename "$PROJECT_PATH")"
+            elif [ -d "$PROJECT_PATH" ]; then
+              # If project_path is a Gradle project folder, package it so the
+              # existing extract/detect steps can process it consistently.
+              if [ -f "$PROJECT_PATH/settings.gradle" ] || [ -f "$PROJECT_PATH/settings.gradle.kts" ] || [ -f "$PROJECT_PATH/gradlew" ]; then
+                mkdir -p "$RUNNER_TEMP/native-input"
+                (cd "$PROJECT_PATH" && zip -qr "$RUNNER_TEMP/native-input/project-input.zip" . -x '.git/*' 'build/*' '**/build/*')
+                TARGET="$RUNNER_TEMP/native-input"
+                ZIP="project-input.zip"
+              else
+                TARGET="$PROJECT_PATH"
               fi
-            done
-          fi
-
-          if [ -z "$ZIP_PATH" ] &&
-             { [ "$ZIP" = "project.zip" ] || [ -z "$ZIP" ]; } &&
-             [ -d build-inputs ]; then
-            ZIP_PATH="$(
-              find build-inputs -type f -iname '*.zip' \
-                -not -path '*/.git/*' \
-                -printf '%T@ %p\n' 2>/dev/null |
-              sort -nr | head -n 1 | cut -d' ' -f2-
-            )"
-          fi
-
-          if [ -z "$ZIP_PATH" ] && [ -d build-inputs ]; then
-            ZIP_PATH="$(
-              find build-inputs -type f -name "$ZIP" \
-                -not -path '*/.git/*' -print -quit 2>/dev/null || true
-            )"
-          fi
-
-          if [ -z "$ZIP_PATH" ] &&
-             [ -f "$RUNNER_TEMP/native-input/project-input.zip" ]; then
-            ZIP_PATH="$RUNNER_TEMP/native-input/project-input.zip"
-          fi
-
-          if [ -z "$ZIP_PATH" ] || [ ! -f "$ZIP_PATH" ]; then
-            echo "::error::File ZIP project tidak ditemukan."
-            echo "Requested ZIP: $ZIP"
-            echo "Target: $TARGET"
-            echo "Project path: $PROJECT_PATH"
-            ls -la .
-            if [ -d build-inputs ]; then
-              find build-inputs -maxdepth 5 -type f | head -n 200
+            elif [[ "$PROJECT_PATH" == *.zip ]]; then
+              TARGET="$(dirname "$PROJECT_PATH")"
+              ZIP="$(basename "$PROJECT_PATH")"
             fi
+          fi
+          [ -n "$TARGET" ] || TARGET="."
+
+          # ═══ CEK FOLDER TARGET ═══
+          if [ ! -d "$TARGET" ]; then
+            echo "::error::Target directory tidak ditemukan: $TARGET"
             exit 1
           fi
 
-          ZIP_PATH="$(realpath "$ZIP_PATH")"
-          ZIP="$(basename "$ZIP_PATH")"
-          TARGET="$(dirname "$ZIP_PATH")"
-
-          if ! unzip -t "$ZIP_PATH" >/dev/null 2>&1; then
-            echo "::error::ZIP tidak valid atau rusak: $ZIP_PATH"
-            unzip -t "$ZIP_PATH" || true
+          # ═══ CEK FILE ZIP ═══
+          if [ ! -f "$TARGET/$ZIP" ]; then
+            echo "::error::File zip tidak ditemukan: $TARGET/$ZIP"
+            ls -la "$TARGET" || true
             exit 1
           fi
 
-          ZIP_BYTES="$(stat -c%s "$ZIP_PATH")"
+          # ═══ LOG INFO ZIP SIZE ═══
+          ZIP_BYTES=$(stat -c%s "$TARGET/$ZIP" 2>/dev/null || stat -f%z "$TARGET/$ZIP")
           ZIP_MB=$((ZIP_BYTES / 1024 / 1024))
-          AVAILABLE_MB="$(df -m "$RUNNER_TEMP" | tail -n 1 | awk '{print $4}')"
+          ZIP_KB=$((ZIP_BYTES / 1024))
+          echo "📦 Zip file: $ZIP"
+          echo "📦 Zip size: ${ZIP_MB} MB (${ZIP_KB} KB / ${ZIP_BYTES} bytes)"
 
-          echo "ZIP: $ZIP_PATH"
-          echo "ZIP size: ${ZIP_MB} MB"
-          echo "Available space: ${AVAILABLE_MB} MB"
-
-          if [ "$AVAILABLE_MB" -lt 5000 ]; then
-            echo "::warning::Disk space kurang dari 5GB."
+          # ═══ CEK ZIP VALID ═══
+          if ! unzip -t "$TARGET/$ZIP" > /dev/null 2>&1; then
+            echo "::warning::Zip mungkin corrupt, tapi tetap lanjut coba extract"
+          else
+            echo "✓ Zip integrity check OK"
           fi
 
-          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
-          echo "zip_size_mb=$ZIP_MB" >> "$GITHUB_OUTPUT"
+          # ═══ CEK DISK SPACE ═══
+          echo "💾 Disk space (before extract):"
+          df -h | head -n 2
 
-      # ============================================================
-      # EXTRACT PROJECT
-      # ============================================================
+          AVAILABLE_MB=$(df -m "$TARGET" | tail -n 1 | awk '{print $4}')
+          echo "💾 Available space: ${AVAILABLE_MB} MB"
+          if [ "$AVAILABLE_MB" -lt 5000 ]; then
+            echo "::warning::Disk space kurang dari 5GB, bisa gagal extract project besar"
+          fi
+
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "zip=$ZIP" >> $GITHUB_OUTPUT
+          echo "zip_size_mb=$ZIP_MB" >> $GITHUB_OUTPUT
+          echo "✓ Validation OK"
+          echo "::endgroup::"
+
       - name: Extract Project Zip
         id: extract
-        shell: bash
         run: |
-          set -Eeuo pipefail
-
-          ZIP_PATH="${{ steps.validate.outputs.zip_path }}"
-          EXTRACT_DIR="$RUNNER_TEMP/native-project"
+          echo "::group::Extract"
+          TARGET="${{ steps.validate.outputs.target }}"
+          ZIP="${{ steps.validate.outputs.zip }}"
+          EXTRACT_DIR="$TARGET/project"
 
           rm -rf "$EXTRACT_DIR"
           mkdir -p "$EXTRACT_DIR"
 
-          unzip -o "$ZIP_PATH" -d "$EXTRACT_DIR"
-          echo "Extracted size: $(du -sh "$EXTRACT_DIR" | awk '{print $1}')"
-          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+          echo "⏳ Extracting $ZIP (${{ steps.validate.outputs.zip_size_mb }} MB)..."
+          START_TIME=$(date +%s)
 
-      # ============================================================
-      # DETECT GRADLE ROOT
-      # ============================================================
+          unzip -o "$TARGET/$ZIP" -d "$EXTRACT_DIR"
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "✓ Extract selesai dalam ${DURATION}s"
+
+          # ═══ LOG SIZE SETELAH EXTRACT ═══
+          EXTRACT_SIZE=$(du -sh "$EXTRACT_DIR" 2>/dev/null | awk '{print $1}')
+          echo "📂 Extracted size: ${EXTRACT_SIZE}"
+
+          echo "💾 Disk space (after extract):"
+          df -h | head -n 2
+
+          echo "::group::Extracted Files"
+          ls -la "$EXTRACT_DIR"
+          echo "::endgroup::"
+
+          echo "extract_dir=$EXTRACT_DIR" >> $GITHUB_OUTPUT
+          echo "✓ Extract OK"
+          echo "::endgroup::"
+
       - name: Detect Gradle Project Root
         id: detect
-        shell: bash
         run: |
-          set -Eeuo pipefail
-
+          echo "::group::Detect Project Root"
           EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+
           ROOT=""
 
-          for FILE in settings.gradle settings.gradle.kts \
-                      build.gradle build.gradle.kts gradlew; do
-            if [ -f "$EXTRACT_DIR/$FILE" ]; then
-              ROOT="$EXTRACT_DIR"
-              break
-            fi
-          done
-
-          if [ -z "$ROOT" ]; then
-            FOUND="$(
-              find "$EXTRACT_DIR" -maxdepth 7 -type f \
-                \( -name settings.gradle -o -name settings.gradle.kts \
-                   -o -name gradlew -o -name build.gradle \
-                   -o -name build.gradle.kts \) \
-                -not -path '*/node_modules/*' \
-                -not -path '*/build/*' \
-                -not -path '*/.gradle/*' -print -quit
-            )"
-
-            [ -n "$FOUND" ] || {
-              echo "::error::Project Gradle tidak ditemukan di ZIP."
-              find "$EXTRACT_DIR" -maxdepth 4 -type f | head -n 100
-              exit 1
-            }
-
-            ROOT="$(dirname "$FOUND")"
-
-            CURRENT="$ROOT"
-            while [ "$CURRENT" != "$EXTRACT_DIR" ] && [ "$CURRENT" != "/" ]; do
-              if [ -f "$CURRENT/settings.gradle" ] ||
-                 [ -f "$CURRENT/settings.gradle.kts" ]; then
-                ROOT="$CURRENT"
-                break
-              fi
-              CURRENT="$(dirname "$CURRENT")"
-            done
-          fi
-
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Project root: $ROOT"
-          ls -la "$ROOT" | head -n 50
-
-      # ============================================================
-      # DETECT FLUTTER ROOT
-      # ============================================================
-      - name: Detect Flutter Project Root
-        id: flutter_detect
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
-          GRADLE_ROOT="${{ steps.detect.outputs.root }}"
-          FLUTTER_ROOT=""
-
-          CURRENT="$GRADLE_ROOT"
-          while [ "$CURRENT" != "/" ]; do
-            if [ -f "$CURRENT/pubspec.yaml" ]; then
-              FLUTTER_ROOT="$CURRENT"
-              break
-            fi
-            CURRENT="$(dirname "$CURRENT")"
-          done
-
-          if [ -z "$FLUTTER_ROOT" ]; then
-            FOUND="$(
-              find "$EXTRACT_DIR" -maxdepth 8 -type f -name pubspec.yaml \
-                -not -path '*/build/*' \
-                -not -path '*/.gradle/*' \
-                -not -path '*/node_modules/*' -print -quit
-            )"
-            [ -z "$FOUND" ] || FLUTTER_ROOT="$(dirname "$FOUND")"
-          fi
-
-          if [ -n "$FLUTTER_ROOT" ]; then
-            echo "is_flutter=true" >> "$GITHUB_OUTPUT"
-            echo "flutter_root=$FLUTTER_ROOT" >> "$GITHUB_OUTPUT"
-            echo "Flutter root: $FLUTTER_ROOT"
+          if [ -f "$EXTRACT_DIR/settings.gradle" ] || [ -f "$EXTRACT_DIR/settings.gradle.kts" ]; then
+            ROOT="$EXTRACT_DIR"
+          elif [ -f "$EXTRACT_DIR/build.gradle" ] || [ -f "$EXTRACT_DIR/build.gradle.kts" ]; then
+            ROOT="$EXTRACT_DIR"
+          elif [ -f "$EXTRACT_DIR/gradlew" ]; then
+            ROOT="$EXTRACT_DIR"
           else
-            echo "is_flutter=false" >> "$GITHUB_OUTPUT"
-            echo "flutter_root=" >> "$GITHUB_OUTPUT"
-            echo "Flutter project tidak ditemukan."
+            FOUND=$(find "$EXTRACT_DIR" -maxdepth 4 \( \
+              -name "settings.gradle" -o \
+              -name "settings.gradle.kts" -o \
+              -name "gradlew" \
+              \) -type f -not -path "*/node_modules/*" -not -path "*/build/*" | head -n 1)
+
+            if [ -z "$FOUND" ]; then
+              echo "::error::Project Gradle tidak ditemukan"
+              find "$EXTRACT_DIR" -maxdepth 3 -type f | head -n 50
+              exit 1
+            fi
+
+            ROOT=$(dirname "$FOUND")
           fi
 
-      # ============================================================
-      # JAVA + CACHE
-      # ============================================================
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
+          echo "✓ Project root: $ROOT"
+
+          echo "::group::Project Structure"
+          ls -la "$ROOT" | head -n 30
+          echo "::endgroup::"
+          echo "::endgroup::"
+
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: ${{ inputs.java_version || '17' }}
+          distribution: 'temurin'
+          java-version: ${{ github.event.inputs.java_version }}
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -339,766 +233,323 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      # ============================================================
-      # ANDROID SDK
-      # ============================================================
       - name: Setup Android SDK
-        shell: bash
         run: |
-          set -Eeuo pipefail
+          echo "::group::Setup Android SDK"
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk
 
-          SDK_ROOT="$HOME/android-sdk"
-          mkdir -p "$SDK_ROOT/cmdline-tools"
-          cd "$RUNNER_TEMP"
+          curl -sSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d cmdline-tools-tmp
+          mv cmdline-tools-tmp/cmdline-tools cmdline-tools/latest
+          rm -rf cmdline-tools-tmp cmdline-tools.zip
 
-          curl -fLsS \
-            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
-            -o android-commandline-tools.zip
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "✓ Android SDK setup OK"
+          echo "::endgroup::"
 
-          mkdir -p "$RUNNER_TEMP/android-cmdline-tools"
-          unzip -q android-commandline-tools.zip -d "$RUNNER_TEMP/android-cmdline-tools"
-
-          rm -rf "$SDK_ROOT/cmdline-tools/latest"
-          mv "$RUNNER_TEMP/android-cmdline-tools/cmdline-tools" \
-            "$SDK_ROOT/cmdline-tools/latest"
-
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-
-          rm -rf "$RUNNER_TEMP/android-cmdline-tools"
-          rm -f android-commandline-tools.zip
-
-      - name: Accept Licenses and Install SDK Packages
-        shell: bash
+      - name: Accept Licenses & Install SDK Packages
         run: |
-          set -Eeuo pipefail
+          echo "::group::Install SDK Packages"
+          yes | sdkmanager --licenses || true
+          sdkmanager --install \
+                     "platform-tools" \
+                     "platforms;android-36" \
+                     "build-tools;36.0.0" \
+                     "platforms;android-35" \
+                     "build-tools;35.0.0" \
+                     "platforms;android-34" \
+                     "build-tools;34.0.0" \
+                     "platforms;android-33" \
+                     "build-tools;33.0.1" \
+                     "platforms;android-32" \
+                     "build-tools;32.0.0" \
+                     "ndk;28.2.13676358"
+          echo "✓ SDK packages installed"
+          echo "::endgroup::"
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "platforms;android-33" \
-            "build-tools;33.0.1" \
-            "platforms;android-32" \
-            "build-tools;32.0.0"
-
-      # ============================================================
-      # FLUTTER SDK
-      # ============================================================
-      - name: Setup Flutter
-        if: steps.flutter_detect.outputs.is_flutter == 'true'
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Flutter Pub Get
-        if: steps.flutter_detect.outputs.is_flutter == 'true'
-        working-directory: ${{ steps.flutter_detect.outputs.flutter_root }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          flutter --version
-          flutter pub get
-
-      # ============================================================
-      # AUTO FIX AGP
-      # ============================================================
-      - name: Auto Fix Android Gradle Plugin
-        id: agp_fix
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-        run: |
-          set -Eeuo pipefail
-
-          ROOT="$PWD"
-          MIN_AGP="8.11.1"
-
-          if [ "$IS_FLUTTER" != "true" ]; then
-            echo "version=unchanged" >> "$GITHUB_OUTPUT"
-            echo "minimum=$MIN_AGP" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          python3 - "$ROOT" "$MIN_AGP" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          target = sys.argv[2]
-          minimum = tuple(map(int, target.split(".")))
-          excluded = {".git", ".gradle", "build", "node_modules"}
-
-          patterns = [
-              re.compile(
-                  r'(?P<prefix>com\.android\.tools\.build:gradle:)'
-                  r'(?P<version>\d+(?:\.\d+){1,2})'
-              ),
-              re.compile(
-                  r'(?P<prefix>id\s*\(?\s*["\']'
-                  r'com\.android\.(?:application|library|test|dynamic-feature)'
-                  r'["\']\s*\)?\s+version\s+["\'])'
-                  r'(?P<version>\d+(?:\.\d+){1,2})'
-                  r'(?P<suffix>["\'])'
-              ),
-              re.compile(
-                  r'(?P<prefix>^[ \t]*(?:agp|androidGradlePlugin)'
-                  r'[ \t]*=[ \t]*["\'])'
-                  r'(?P<version>\d+(?:\.\d+){1,2})'
-                  r'(?P<suffix>["\'])',
-                  re.MULTILINE
-              ),
-          ]
-
-          def replace(match):
-              version = match.group("version")
-              try:
-                  parts = tuple(map(int, version.split(".")))
-              except ValueError:
-                  return match.group(0)
-              if parts < minimum:
-                  return (
-                      match.group("prefix") + target
-                      + match.groupdict().get("suffix", "")
-                  )
-              return match.group(0)
-
-          changed = []
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
-              if any(part in excluded for part in path.relative_to(root).parts):
-                  continue
-              if len(path.relative_to(root).parts) > 8:
-                  continue
-              if path.name not in {
-                  "settings.gradle", "settings.gradle.kts",
-                  "build.gradle", "build.gradle.kts", "libs.versions.toml"
-              }:
-                  continue
-
-              try:
-                  original = path.read_text(encoding="utf-8")
-              except (OSError, UnicodeError):
-                  continue
-
-              updated = original
-              for pattern in patterns:
-                  updated = pattern.sub(replace, updated)
-
-              if path.name == "libs.versions.toml":
-                  section = re.search(
-                      r'(?ms)^\[versions\]\s*(.*?)(?=^\[|\Z)',
-                      updated
-                  )
-                  if section:
-                      start, end = section.span(1)
-                      block = section.group(1)
-                      block = re.sub(
-                          r'(?m)^(\s*(?:agp|androidGradlePlugin)\s*=\s*["\'])'
-                          r'(\d+(?:\.\d+){1,2})(["\'])',
-                          lambda m: (
-                              m.group(1) + target + m.group(3)
-                              if tuple(map(int, m.group(2).split("."))) < minimum
-                              else m.group(0)
-                          ),
-                          block
-                      )
-                      updated = updated[:start] + block + updated[end:]
-
-              if updated != original:
-                  path.write_text(updated, encoding="utf-8")
-                  changed.append(str(path.relative_to(root)))
-
-          print("AGP files updated:", changed or "none")
-          PY
-
-          echo "version=$MIN_AGP" >> "$GITHUB_OUTPUT"
-          echo "minimum=$MIN_AGP" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # AUTO FIX KOTLIN VERSION
-      # Fixes common explicit Kotlin versions and version catalogs.
-      # ============================================================
-      - name: Auto Fix Kotlin Compatibility
-        id: kotlin_fix
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-        run: |
-          set -Eeuo pipefail
-
-          ROOT="$PWD"
-          MIN_KOTLIN="2.2.20"
-
-          if [ "$IS_FLUTTER" != "true" ]; then
-            echo "version=unchanged" >> "$GITHUB_OUTPUT"
-            echo "minimum=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          python3 - "$ROOT" "$MIN_KOTLIN" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          target = sys.argv[2]
-          minimum = tuple(map(int, target.split(".")))
-          excluded = {".git", ".gradle", "build", "node_modules", ".dart_tool"}
-
-          plugin_patterns = [
-              re.compile(
-                  r'(?P<prefix>\bid\s*\(?\s*["\']'
-                  r'org\.jetbrains\.kotlin\.(?:android|jvm|multiplatform|kapt|plugin\.serialization)'
-                  r'["\']\s*\)?\s+version\s+["\'])'
-                  r'(?P<version>\d+(?:\.\d+){1,3})'
-                  r'(?P<suffix>["\'])'
-              ),
-              re.compile(
-                  r'(?P<prefix>\bkotlin\s*\(\s*["\']'
-                  r'(?:android|jvm|multiplatform|kapt)'
-                  r'["\']\s*\)\s+version\s+["\'])'
-                  r'(?P<version>\d+(?:\.\d+){1,3})'
-                  r'(?P<suffix>["\'])'
-              ),
-              re.compile(
-                  r'(?P<prefix>\borg\.jetbrains\.kotlin:'
-                  r'kotlin-gradle-plugin:)'
-                  r'(?P<version>\d+(?:\.\d+){1,3})'
-              ),
-              re.compile(
-                  r'(?P<prefix>\b(?:ext\.)?kotlin_version\s*=\s*["\'])'
-                  r'(?P<version>\d+(?:\.\d+){1,3})'
-                  r'(?P<suffix>["\'])'
-              ),
-          ]
-
-          def replace_version(match):
-              try:
-                  current = tuple(map(int, match.group("version").split(".")))
-              except ValueError:
-                  return match.group(0)
-              if current < minimum:
-                  return (
-                      match.group("prefix") + target
-                      + match.groupdict().get("suffix", "")
-                  )
-              return match.group(0)
-
-          changed = []
-
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
-              relative = path.relative_to(root)
-              if any(part in excluded for part in relative.parts):
-                  continue
-              if len(relative.parts) > 8:
-                  continue
-              if path.name not in {
-                  "settings.gradle", "settings.gradle.kts",
-                  "build.gradle", "build.gradle.kts", "libs.versions.toml"
-              }:
-                  continue
-
-              try:
-                  original = path.read_text(encoding="utf-8")
-              except (OSError, UnicodeError):
-                  continue
-
-              updated = original
-              for pattern in plugin_patterns:
-                  updated = pattern.sub(replace_version, updated)
-
-              # Version catalog: only edit Kotlin keys inside [versions].
-              if path.name == "libs.versions.toml":
-                  sections = list(re.finditer(
-                      r'(?m)^\[([^\]]+)\]\s*$',
-                      updated
-                  ))
-                  for index, section in enumerate(sections):
-                      if section.group(1).strip() != "versions":
-                          continue
-
-                      start = section.end()
-                      end = (
-                          sections[index + 1].start()
-                          if index + 1 < len(sections)
-                          else len(updated)
-                      )
-                      block = updated[start:end]
-
-                      block = re.sub(
-                          r'(?m)^(\s*(?:kotlin|kotlinVersion|kotlin_version|'
-                          r'kotlinAndroid|kotlin-android)\s*=\s*["\'])'
-                          r'(\d+(?:\.\d+){1,3})(["\'])',
-                          lambda m: (
-                              m.group(1) + target + m.group(3)
-                              if tuple(map(int, m.group(2).split("."))) < minimum
-                              else m.group(0)
-                          ),
-                          block
-                      )
-                      updated = updated[:start] + block + updated[end:]
-                      break
-
-              if updated != original:
-                  path.write_text(updated, encoding="utf-8")
-                  changed.append(str(relative))
-
-          print("Kotlin files updated:", changed or "none")
-          PY
-
-          # Check common explicit declarations. Fail early if an old
-          # literal version remains, instead of wasting a build attempt.
-          python3 - "$ROOT" "$MIN_KOTLIN" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          target = sys.argv[2]
-          minimum = tuple(map(int, target.split(".")))
-          excluded = {".git", ".gradle", "build", "node_modules", ".dart_tool"}
-          patterns = [
-              r'org\.jetbrains\.kotlin\.(?:android|jvm|multiplatform|kapt|plugin\.serialization)["\']\s*\)?\s+version\s+["\'](\d+(?:\.\d+){1,3})',
-              r'kotlin\s*\(\s*["\'](?:android|jvm|multiplatform|kapt)["\']\s*\)\s+version\s+["\'](\d+(?:\.\d+){1,3})',
-              r'org\.jetbrains\.kotlin:kotlin-gradle-plugin:(\d+(?:\.\d+){1,3})',
-              r'\b(?:ext\.)?kotlin_version\s*=\s*["\'](\d+(?:\.\d+){1,3})',
-          ]
-
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
-              relative = path.relative_to(root)
-              if any(part in excluded for part in relative.parts):
-                  continue
-              if len(relative.parts) > 8:
-                  continue
-              if path.name not in {
-                  "settings.gradle", "settings.gradle.kts",
-                  "build.gradle", "build.gradle.kts"
-              }:
-                  continue
-
-              try:
-                  content = path.read_text(encoding="utf-8")
-              except (OSError, UnicodeError):
-                  continue
-
-              for pattern in patterns:
-                  for match in re.finditer(pattern, content):
-                      version = match.group(1)
-                      parsed = tuple(map(int, version.split(".")))
-                      print(f"Kotlin declaration: {relative}: {version}")
-                      if parsed < minimum:
-                          print(
-                              f"::error::Kotlin {version} masih di bawah "
-                              f"minimum {target}: {relative}"
-                          )
-                          sys.exit(1)
-
-          print("Kotlin explicit-version validation passed.")
-          PY
-
-          echo "version=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
-          echo "minimum=$MIN_KOTLIN" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # AUTO SELECT GRADLE
-      # ============================================================
-      - name: Auto Detect Compatible Gradle
-        id: gradle_version
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-          AGP_VERSION: ${{ steps.agp_fix.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-
-          ROOT="$PWD"
-          WRAPPER="$ROOT/gradle/wrapper/gradle-wrapper.properties"
-          SELECTED=""
-          REQUIRED="8.0"
-          AGP="${AGP_VERSION:-unknown}"
-
-          if [[ "$AGP" =~ ^([0-9]+)\.([0-9]+) ]]; then
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR="${BASH_REMATCH[2]}"
-
-            if [ "$MAJOR" -ge 9 ]; then
-              REQUIRED="9.1.0"
-            elif [ "$MAJOR" -eq 8 ]; then
-              if [ "$MINOR" -ge 11 ]; then
-                REQUIRED="8.13"
-              elif [ "$MINOR" -ge 10 ]; then
-                REQUIRED="8.11.1"
-              elif [ "$MINOR" -ge 9 ]; then
-                REQUIRED="8.11.1"
-              elif [ "$MINOR" -ge 8 ]; then
-                REQUIRED="8.10.2"
-              elif [ "$MINOR" -ge 7 ]; then
-                REQUIRED="8.9"
-              elif [ "$MINOR" -ge 6 ]; then
-                REQUIRED="8.7"
-              elif [ "$MINOR" -ge 4 ]; then
-                REQUIRED="8.6"
-              elif [ "$MINOR" -ge 3 ]; then
-                REQUIRED="8.4"
-              elif [ "$MINOR" -ge 2 ]; then
-                REQUIRED="8.2"
-              else
-                REQUIRED="8.0"
-              fi
-            elif [ "$MAJOR" -eq 7 ]; then
-              REQUIRED="7.0"
-            else
-              REQUIRED="6.7"
-            fi
-          fi
-
-          # Keep the known Flutter + AGP 8.11.x combination on Gradle 8.
-          if [ "$IS_FLUTTER" = "true" ]; then
-            REQUIRED="8.14.3"
-          fi
-
-          if [ -f "$WRAPPER" ]; then
-            URL="$(grep -E '^distributionUrl=' "$WRAPPER" | tail -n 1 || true)"
-            SELECTED="$(
-              printf '%s\n' "$URL" |
-              sed -nE 's#.*gradle-([0-9]+(\.[0-9]+){1,2})-(bin|all)\.zip.*#\1#p'
-            )"
-          fi
-
-          [ -n "$SELECTED" ] || SELECTED="$REQUIRED"
-
-          HIGHEST="$(
-            printf '%s\n%s\n' "$SELECTED" "$REQUIRED" |
-            sort -V | tail -n 1
-          )"
-          if [ "$HIGHEST" != "$SELECTED" ]; then
-            SELECTED="$REQUIRED"
-          fi
-
-          DIST_TYPE="bin"
-          if [ -f "$WRAPPER" ] &&
-             grep -qE 'gradle-[^/]*-all\.zip' "$WRAPPER"; then
-            DIST_TYPE="all"
-          fi
-
-          mkdir -p "$(dirname "$WRAPPER")"
-          touch "$WRAPPER"
-
-          if grep -qE '^distributionUrl=' "$WRAPPER"; then
-            sed -i -E \
-              "s#^distributionUrl=.*#distributionUrl=https\\\\://services.gradle.org/distributions/gradle-${SELECTED}-${DIST_TYPE}.zip#" \
-              "$WRAPPER"
-          else
-            printf 'distributionUrl=https\\://services.gradle.org/distributions/gradle-%s-%s.zip\n' \
-              "$SELECTED" "$DIST_TYPE" >> "$WRAPPER"
-          fi
-
-          grep -q '^distributionBase=' "$WRAPPER" ||
-            echo 'distributionBase=GRADLE_USER_HOME' >> "$WRAPPER"
-          grep -q '^distributionPath=' "$WRAPPER" ||
-            echo 'distributionPath=wrapper/dists' >> "$WRAPPER"
-          grep -q '^zipStoreBase=' "$WRAPPER" ||
-            echo 'zipStoreBase=GRADLE_USER_HOME' >> "$WRAPPER"
-          grep -q '^zipStorePath=' "$WRAPPER" ||
-            echo 'zipStorePath=wrapper/dists' >> "$WRAPPER"
-
-          echo "Selected Gradle: $SELECTED"
-          echo "Required Gradle: $REQUIRED"
-          cat "$WRAPPER"
-
-          echo "version=$SELECTED" >> "$GITHUB_OUTPUT"
-          echo "required_version=$REQUIRED" >> "$GITHUB_OUTPUT"
-          echo "agp_version=$AGP" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # PREPARE WRAPPER
-      # ============================================================
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/gradle-build-action@v3
         with:
-          gradle-version: ${{ steps.gradle_version.outputs.version }}
+          gradle-version: 8.2
 
-      - name: Prepare Gradle Wrapper
-        working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          DETECTED_GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-
-          if [ ! -f gradle/wrapper/gradle-wrapper.jar ] ||
-             [ ! -f gradlew ]; then
-            gradle wrapper \
-              --gradle-version "$DETECTED_GRADLE_VERSION" \
-              --distribution-type bin
-          fi
-
-          chmod +x gradlew
-
-          sed -i -E \
-            "s#^distributionUrl=.*#distributionUrl=https\\\\://services.gradle.org/distributions/gradle-${DETECTED_GRADLE_VERSION}-bin.zip#" \
-            gradle/wrapper/gradle-wrapper.properties
-
-          grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties
-
-      # ============================================================
-      # ICON GENERATION
-      # ============================================================
       - name: Auto-Generate Missing Icons
         id: gen_icons
         working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
         run: |
-          set -Eeuo pipefail
+          echo "::group::Auto-Generate Missing Icons"
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick
 
-          MANIFEST="$(
-            find . -type f -name AndroidManifest.xml \
-              -path '*/main/*' -print -quit
-          )"
-
+          MANIFEST=$(find . -name "AndroidManifest.xml" -path "*/main/*" -type f | head -n 1)
           if [ -z "$MANIFEST" ]; then
-            echo "::warning::AndroidManifest.xml tidak ditemukan."
+            echo "::warning::AndroidManifest.xml tidak ditemukan — skip icon generation"
+            echo "::endgroup::"
             exit 0
           fi
 
-          RES_DIR="$(dirname "$MANIFEST")/res"
-          [ -d "$RES_DIR" ] || {
-            echo "::warning::Folder res tidak ditemukan."
+          echo "Manifest: $MANIFEST"
+          RES_DIR=$(dirname "$MANIFEST")/res
+
+          if [ ! -d "$RES_DIR" ]; then
+            echo "::warning::res/ folder tidak ditemukan — skip icon generation"
+            echo "::endgroup::"
             exit 0
-          }
+          fi
 
-          ICONS="$(
-            grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" |
-            sed 's|@mipmap/||' | sort -u || true
-          )"
+          echo "Res dir: $RES_DIR"
 
-          for ICON in $ICONS; do
-            for ITEM in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-              DENSITY="${ITEM%%:*}"
-              SIZE="${ITEM##*:}"
-              DIR="$RES_DIR/mipmap-$DENSITY"
-              FILE="$DIR/$ICON.png"
+          ICONS=$(grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" | sed 's|@mipmap/||' | sort -u)
 
-              [ -f "$FILE" ] && continue
-              mkdir -p "$DIR"
+          if [ -z "$ICONS" ]; then
+            echo "::warning::Tidak ada referensi @mipmap/ di manifest"
+            echo "::endgroup::"
+            exit 0
+          fi
 
-              INITIAL="$(printf '%s' "$ICON" | cut -c1 | tr '[:lower:]' '[:upper:]')"
-              COLOR="#3B82F6"
-              case "$ICON" in
+          echo "Icons yang dibutuhin:"
+          echo "$ICONS"
+
+          for icon in $ICONS; do
+            for density_size in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
+              density=$(echo "$density_size" | cut -d: -f1)
+              size=$(echo "$density_size" | cut -d: -f2)
+              target_dir="$RES_DIR/mipmap-$density"
+              target_file="$target_dir/$icon.png"
+
+              if [ -f "$target_file" ]; then
+                continue
+              fi
+
+              mkdir -p "$target_dir"
+
+              INITIAL=$(echo "$icon" | head -c 1 | tr '[:lower:]' '[:upper:]')
+
+              case "$icon" in
                 *instagram*) COLOR="#E1306C" ;;
-                *youtube*) COLOR="#FF0000" ;;
-                *whatsapp*) COLOR="#25D366" ;;
-                *telegram*) COLOR="#0088CC" ;;
-                *round*) COLOR="#4A90E2" ;;
-                *launcher*) COLOR="#10B981" ;;
+                *youtube*)   COLOR="#FF0000" ;;
+                *whatsapp*)  COLOR="#25D366" ;;
+                *telegram*)  COLOR="#0088CC" ;;
+                *nxxx*)      COLOR="#FF6B9D" ;;
+                *round*)     COLOR="#4A90E2" ;;
+                *launcher*)  COLOR="#10B981" ;;
+                *)           COLOR="#3B82F6" ;;
               esac
 
-              convert -size "${SIZE}x${SIZE}" "xc:$COLOR" \
-                -gravity center -pointsize "$((SIZE / 2))" \
-                -fill white -font DejaVu-Sans-Bold \
-                -annotate +0+0 "$INITIAL" "$FILE" || \
-                echo "::warning::Gagal membuat $FILE"
+              convert -size ${size}x${size} "xc:$COLOR" \
+                -gravity center \
+                -pointsize $((size / 2)) \
+                -fill white \
+                -font DejaVu-Sans-Bold \
+                -annotate +0+0 "$INITIAL" \
+                "$target_file" 2>/dev/null || \
+              convert -size ${size}x${size} "xc:$COLOR" \
+                -gravity center \
+                -pointsize $((size / 2)) \
+                -fill white \
+                -annotate +0+0 "$INITIAL" \
+                "$target_file"
+
+              echo "✓ Generated: $target_file"
             done
           done
 
-      # ============================================================
-      # LOCAL.PROPERTIES
-      # ============================================================
+          echo "✓ All icons generated"
+          echo "::endgroup::"
+
+      - name: Prepare Gradle Wrapper
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          echo "::group::Prepare Gradle Wrapper"
+          mkdir -p gradle/wrapper
+
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "⚠️ gradle-wrapper.jar missing — generating..."
+            gradle wrapper --gradle-version 8.2 --distribution-type bin
+          fi
+
+          if [ ! -f "gradlew" ]; then
+            echo "⚠️ gradlew missing — generating..."
+            gradle wrapper --gradle-version 8.2 --distribution-type bin
+          fi
+
+          chmod +x gradlew
+          echo "✓ gradlew executable"
+          echo "::endgroup::"
+
       - name: Fix local.properties
         working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-          FLUTTER_PROJECT_ROOT: ${{ steps.flutter_detect.outputs.flutter_root }}
         run: |
-          set -Eeuo pipefail
+          echo "::group::Fix local.properties"
+          rm -f local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
+          echo "✓ local.properties OK"
+          echo "::endgroup::"
 
-          PROPERTIES="local.properties"
-          TEMP_FILE="$(mktemp)"
+      # Fixes the fatal Flutter error where font_awesome_flutter 10.x extends
+      # IconData, which is final in the Flutter SDK used by this runner.
+      # This step only edits the dependency declaration when a Flutter project
+      # is present; it does not remove existing workflow features.
+      - name: Fix Flutter Font Awesome Compatibility
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Fix Flutter Font Awesome Compatibility"
 
-          if [ -f "$PROPERTIES" ]; then
-            grep -vE '^(sdk\.dir|flutter\.sdk)=' "$PROPERTIES" \
-              > "$TEMP_FILE" || true
-          fi
-
-          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" >> "$TEMP_FILE"
-
-          if [ "$IS_FLUTTER" = "true" ]; then
-            FLUTTER_BIN="$(readlink -f "$(command -v flutter)")"
-            FLUTTER_SDK="$(dirname "$(dirname "$FLUTTER_BIN")")"
-
-            if [ ! -d "$FLUTTER_SDK/packages/flutter_tools" ]; then
-              echo "::error::Flutter SDK tidak valid: $FLUTTER_SDK"
-              rm -f "$TEMP_FILE"
-              exit 1
+          PUBSPEC=""
+          for candidate in \
+            "$PWD/pubspec.yaml" \
+            "$(dirname "$PWD")/pubspec.yaml" \
+            "$(dirname "$(dirname "$PWD")")/pubspec.yaml"; do
+            if [ -f "$candidate" ]; then
+              PUBSPEC="$candidate"
+              break
             fi
+          done
 
-            printf 'flutter.sdk=%s\n' "$FLUTTER_SDK" >> "$TEMP_FILE"
-            echo "Flutter project: $FLUTTER_PROJECT_ROOT"
-            echo "Flutter SDK: $FLUTTER_SDK"
+          if [ -z "$PUBSPEC" ]; then
+            PUBSPEC="$(find .. -maxdepth 5 -name pubspec.yaml \
+              -not -path '*/.dart_tool/*' \
+              -not -path '*/build/*' \
+              -not -path '*/.pub-cache/*' -type f | head -n 1 || true)"
           fi
 
-          mv "$TEMP_FILE" "$PROPERTIES"
-          cat "$PROPERTIES"
+          if [ -z "$PUBSPEC" ]; then
+            echo "No Flutter pubspec.yaml found; skipping Flutter-specific dependency fix."
+            echo "::endgroup::"
+            exit 0
+          fi
 
-      # ============================================================
-      # BUILD WITH LIMITED COMPATIBILITY AUTO-RETRY
-      # ============================================================
+          echo "Flutter pubspec: $PUBSPEC"
+          if ! command -v flutter >/dev/null 2>&1; then
+            echo "::warning::Flutter CLI is not installed on this runner; cannot update Flutter dependencies."
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # Update only font_awesome_flutter's direct dependency constraint.
+          # Other dependencies and workflow inputs remain unchanged.
+          python3 - "$PUBSPEC" <<'PYCODE'
+          import re, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          pattern = r'(?m)^(\s*font_awesome_flutter\s*:\s*)([^#\n]+)'
+          replacement = r'\g<1>^11.0.0'
+          updated, count = re.subn(pattern, replacement, text, count=1)
+          if count:
+              path.write_text(updated, encoding="utf-8")
+              print("Updated font_awesome_flutter dependency to ^11.0.0")
+          else:
+              print("font_awesome_flutter is not declared directly in pubspec.yaml; no pubspec edit made")
+          PYCODE
+
+          FLUTTER_DIR="$(dirname "$PUBSPEC")"
+          (
+            cd "$FLUTTER_DIR"
+            flutter pub get
+          )
+
+          echo "::endgroup::"
+
       - name: Build with Gradle
         id: gradle_build
         working-directory: ${{ steps.detect.outputs.root }}
-        shell: bash
-        env:
-          INPUT_TASK: ${{ inputs.build_task }}
-          INPUT_MODE: ${{ inputs.build_mode }}
-          INPUT_FLAVOR: ${{ inputs.build_flavor }}
         run: |
-          set -uo pipefail
-
-          TASK="${INPUT_TASK:-assembleRelease}"
-          MODE="$(printf '%s' "${INPUT_MODE:-}" | tr '[:upper:]' '[:lower:]')"
-          FLAVOR="${INPUT_FLAVOR:-}"
-
-          case "$MODE" in
+          echo "::group::Gradle Build"
+          TASK="${{ github.event.inputs.build_task }}"
+          MODE="${{ github.event.inputs.build_mode }}"
+          FLAVOR="${{ github.event.inputs.build_flavor }}"
+          # Accept common bot build_mode values as aliases for Gradle tasks.
+          case "$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')" in
             debug|assembledebug|apk-debug) TASK="assembleDebug" ;;
             release|assemblerelease|apk|apk-release) TASK="assembleRelease" ;;
             bundle|bundlerelease|aab) TASK="bundleRelease" ;;
             bundledebug) TASK="bundleDebug" ;;
           esac
-
-          case "$TASK" in
-            assembleRelease|assembleDebug|bundleRelease|bundleDebug) ;;
-            *)
-              echo "::error::Gradle task tidak diizinkan: $TASK"
-              exit 1
-              ;;
-          esac
+          [ -n "$TASK" ] || TASK="assembleRelease"
 
           if [ -n "$FLAVOR" ]; then
-            CAP_FLAVOR="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+            CAP_FLAVOR="$(echo ${FLAVOR:0:1} | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
             FINAL_TASK="${TASK}${CAP_FLAVOR}"
           else
             FINAL_TASK="$TASK"
           fi
 
-          echo "Gradle: ${{ steps.gradle_version.outputs.version }}"
-          echo "AGP: ${{ steps.gradle_version.outputs.agp_version }}"
-          echo "Kotlin minimum: ${{ steps.kotlin_fix.outputs.minimum }}"
-          echo "Task: $FINAL_TASK"
+          echo "Running: ./gradlew $FINAL_TASK"
+          ./gradlew "$FINAL_TASK" --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
+          EXIT_CODE=${PIPESTATUS[0]}
 
-          MAX_ATTEMPTS=2
-          ATTEMPT=1
-          EXIT_CODE=1
+          echo "Exit code: $EXIT_CODE"
+          echo "::endgroup::"
+          exit $EXIT_CODE
 
-          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-            echo "::group::Build attempt $ATTEMPT/$MAX_ATTEMPTS"
-
-            set +e
-            ./gradlew "$FINAL_TASK" --no-daemon --stacktrace 2>&1 |
-              tee /tmp/gradle.log
-            EXIT_CODE=${PIPESTATUS[0]}
-            set -e
-
-            echo "::endgroup::"
-
-            [ "$EXIT_CODE" -eq 0 ] && break
-            [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] || break
-
-            if grep -Eqi \
-              'Gradle build daemon disappeared unexpectedly|Could not .*lock.*file|already locked by this process|corrupt.*cache|Could not open.*cache' \
-              /tmp/gradle.log; then
-              echo "::warning::Masalah cache/daemon dikenali; membersihkan cache proyek lalu retry sekali."
-              rm -rf .gradle
-              find . -type d -name .gradle -prune -exec rm -rf {} + 2>/dev/null || true
-              ATTEMPT=$((ATTEMPT + 1))
-              continue
-            fi
-
-            if grep -Eqi \
-              'Your project.s Kotlin version.*lower than Flutter.s minimum supported version|Unsupported Kotlin plugin version' \
-              /tmp/gradle.log; then
-              echo "::error::Kotlin masih tidak kompatibel. Periksa alias plugin atau versi Kotlin yang ditentukan oleh script eksternal."
-            elif grep -Eqi \
-              'Your project.s Android Gradle Plugin version.*lower than Flutter.s minimum supported version' \
-              /tmp/gradle.log; then
-              echo "::error::AGP yang efektif masih terlalu lama. Periksa alias plugin atau deklarasi versi eksternal."
-            elif grep -Eqi \
-              'flutter.sdk not set in local.properties|Flutter SDK not found' \
-              /tmp/gradle.log; then
-              echo "::error::Flutter SDK belum terbaca oleh konfigurasi Gradle."
-            elif grep -Eqi \
-              'Unsupported class file major version|requires Java|Java .* is not supported' \
-              /tmp/gradle.log; then
-              echo "::error::Terdeteksi ketidakcocokan Java/Gradle."
-            fi
-
-            break
-          done
-
-          exit "$EXIT_CODE"
-
-      # ============================================================
-      # BUILD ERROR LOG
-      # ============================================================
-      - name: Show Gradle Error
+      - name: Show Gradle Error (Kalau Gagal)
         if: failure()
-        shell: bash
         run: |
-          echo "::group::Gradle Error (Last 150 lines)"
+          echo "::group::Gradle Error (Last 100 lines)"
           if [ -f /tmp/gradle.log ]; then
-            tail -n 150 /tmp/gradle.log
-          else
-            echo "File /tmp/gradle.log belum tersedia."
+            tail -n 100 /tmp/gradle.log
           fi
           echo "::endgroup::"
 
-      # ============================================================
-      # LOCATE APK/AAB
-      # ============================================================
-      - name: Locate APK/AAB
+      - name: Locate APK/AAB (RECURSIVE SEARCH)
         id: locate
         if: success()
-        shell: bash
         run: |
-          set -Eeuo pipefail
-
           ROOT="${{ steps.detect.outputs.root }}"
+          echo "=== Searching in: $ROOT ==="
+          echo ""
 
-          APKS="$(
-            find "$ROOT" -type f -name '*.apk' \
-              -not -path '*/.gradle/*' -not -path '*/.git/*' \
-              2>/dev/null || true
-          )"
-          AABS="$(
-            find "$ROOT" -type f -name '*.aab' \
-              -not -path '*/.gradle/*' -not -path '*/.git/*' \
-              2>/dev/null || true
-          )"
+          echo "::group::Folder Tree (max 3 level)"
+          find "$ROOT" -maxdepth 3 -type d -not -path "*/\.*" | head -n 40
+          echo "::endgroup::"
+
+          echo "::group::Searching for APK (recursive)"
+          APKS=$(find "$ROOT" -type f -name "*.apk" -not -path "*/\.gradle/*" -not -path "*/\.git/*" 2>/dev/null)
+          if [ -n "$APKS" ]; then
+            echo "✓ APK ditemukan:"
+            echo "$APKS"
+          else
+            echo "✕ Tidak ada APK"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Searching for AAB (recursive)"
+          AABS=$(find "$ROOT" -type f -name "*.aab" -not -path "*/\.gradle/*" -not -path "*/\.git/*" 2>/dev/null)
+          if [ -n "$AABS" ]; then
+            echo "✓ AAB ditemukan:"
+            echo "$AABS"
+          else
+            echo "✕ Tidak ada AAB"
+          fi
+          echo "::endgroup::"
 
           if [ -z "$APKS" ] && [ -z "$AABS" ]; then
-            echo "::error::Tidak ada APK/AAB yang dihasilkan."
-            find "$ROOT" -type d \( -name build -o -name outputs \) \
-              2>/dev/null | head -n 50
+            echo "::error::Tidak ada APK/AAB yang dihasilkan"
+            echo ""
+            echo "::group::Debug — cari folder build"
+            find "$ROOT" -type d -name "build" 2>/dev/null | head -n 20
+            echo "::endgroup::"
+
+            echo "::group::Debug — cari folder outputs"
+            find "$ROOT" -type d -name "outputs" 2>/dev/null | head -n 20
+            echo "::endgroup::"
+
+            echo "::group::Debug — semua file .apk / .aab"
+            find "$ROOT" -type f \( -name "*.apk" -o -name "*.aab" \) 2>/dev/null
+            echo "::endgroup::"
+
+            echo "::group::Debug — gradle output folder"
+            find "$ROOT" -path "*app/build/outputs*" -type f 2>/dev/null | head -n 30
+            echo "::endgroup::"
+
             exit 1
           fi
 
@@ -1106,72 +557,45 @@ jobs:
             echo "apks<<EOF"
             echo "$APKS"
             echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          {
             echo "aabs<<EOF"
             echo "$AABS"
             echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          } >> $GITHUB_OUTPUT
 
-      # ============================================================
-      # BUILD INFO
-      # ============================================================
+          echo ""
+          echo "✓ Locate APK/AAB selesai"
+
       - name: Generate Build Info
         if: always()
-        shell: bash
-        env:
-          REQUESTED_ZIP: ${{ inputs.zip_file }}
-          RESOLVED_ZIP: ${{ steps.validate.outputs.zip }}
-          ZIP_SIZE: ${{ steps.validate.outputs.zip_size_mb }}
-          PROJECT_PATH: ${{ inputs.project_path }}
-          TARGET_DIR: ${{ inputs.target_dir }}
-          SERVER: ${{ inputs.server }}
-          USER_ID: ${{ inputs.user_id }}
-          USERNAME: ${{ inputs.username }}
-          USER_NAME: ${{ inputs.user_name }}
-          BUILD_MODE: ${{ inputs.build_mode }}
-          BUILD_TASK: ${{ inputs.build_task }}
-          BUILD_FLAVOR: ${{ inputs.build_flavor }}
-          JAVA_VERSION: ${{ inputs.java_version }}
-          PROJECT_ROOT: ${{ steps.detect.outputs.root }}
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-          FLUTTER_ROOT: ${{ steps.flutter_detect.outputs.flutter_root }}
-          GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
-          REQUIRED_GRADLE: ${{ steps.gradle_version.outputs.required_version }}
-          AGP_VERSION: ${{ steps.gradle_version.outputs.agp_version }}
-          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.version }}
         run: |
+          echo "::group::Build Info"
           {
             echo "=== NATIVE BUILD INFO ==="
-            echo "Job ID: $GITHUB_RUN_ID"
-            echo "Run Number: $GITHUB_RUN_NUMBER"
-            echo "Target Dir: $TARGET_DIR"
-            echo "Project Path: $PROJECT_PATH"
-            echo "Server: $SERVER"
-            echo "User ID: $USER_ID"
-            echo "Username: $USERNAME"
-            echo "User Name: $USER_NAME"
-            echo "Requested Zip: $REQUESTED_ZIP"
-            echo "Resolved Zip: $RESOLVED_ZIP"
-            echo "Zip Size: $ZIP_SIZE MB"
-            echo "Build Mode: $BUILD_MODE"
-            echo "Build Task: $BUILD_TASK"
-            echo "Build Flavor: $BUILD_FLAVOR"
-            echo "Java Version: $JAVA_VERSION"
-            echo "Project Root: $PROJECT_ROOT"
-            echo "Flutter Project: $IS_FLUTTER"
-            echo "Flutter Root: $FLUTTER_ROOT"
-            echo "Gradle Version: $GRADLE_VERSION"
-            echo "Required Gradle: $REQUIRED_GRADLE"
-            echo "AGP Version: $AGP_VERSION"
-            echo "Kotlin Minimum/Target: $KOTLIN_VERSION"
-            echo "Commit: $GITHUB_SHA"
-            echo "Actor: $GITHUB_ACTOR"
-            echo "Finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Job ID: ${{ github.run_id }}"
+            echo "Run Number: ${{ github.run_number }}"
+            echo "Target Dir: ${{ github.event.inputs.target_dir }}"
+            echo "Project Path: ${{ github.event.inputs.project_path }}"
+            echo "Server: ${{ github.event.inputs.server }}"
+            echo "User ID: ${{ github.event.inputs.user_id }}"
+            echo "Username: ${{ github.event.inputs.username }}"
+            echo "User Name: ${{ github.event.inputs.user_name }}"
+            echo "Zip File: ${{ github.event.inputs.zip_file }}"
+            echo "Zip Size: ${{ steps.validate.outputs.zip_size_mb }} MB"
+            echo "Build Task: ${{ github.event.inputs.build_task }}"
+            echo "Build Flavor: ${{ github.event.inputs.build_flavor }}"
+            echo "Java Version: ${{ github.event.inputs.java_version }}"
+            echo "Project Root: ${{ steps.detect.outputs.root }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Actor: ${{ github.actor }}"
+            echo "Finished: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           } > BUILD_INFO.txt
-          cat BUILD_INFO.txt
 
-      # ============================================================
-      # UPLOAD ARTIFACTS
-      # ============================================================
+          cat BUILD_INFO.txt
+          echo "::endgroup::"
+
       - name: Upload APK
         if: success() && steps.locate.outputs.apks != ''
         uses: actions/upload-artifact@v4
@@ -1208,43 +632,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ============================================================
-      # SUMMARY
-      # ============================================================
       - name: Summary
         if: always()
-        shell: bash
-        env:
-          REQUESTED_ZIP: ${{ inputs.zip_file }}
-          RESOLVED_ZIP: ${{ steps.validate.outputs.zip }}
-          ZIP_SIZE: ${{ steps.validate.outputs.zip_size_mb }}
-          BUILD_MODE: ${{ inputs.build_mode }}
-          BUILD_TASK: ${{ inputs.build_task }}
-          BUILD_FLAVOR: ${{ inputs.build_flavor }}
-          JAVA_VERSION: ${{ inputs.java_version }}
-          IS_FLUTTER: ${{ steps.flutter_detect.outputs.is_flutter }}
-          GRADLE_VERSION: ${{ steps.gradle_version.outputs.version }}
-          REQUIRED_GRADLE: ${{ steps.gradle_version.outputs.required_version }}
-          AGP_VERSION: ${{ steps.gradle_version.outputs.agp_version }}
-          KOTLIN_VERSION: ${{ steps.kotlin_fix.outputs.version }}
         run: |
-          {
-            echo "## Native Build Summary"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|-------|"
-            echo "| Job ID | $GITHUB_RUN_ID |"
-            echo "| Requested ZIP | $REQUESTED_ZIP |"
-            echo "| Resolved ZIP | $RESOLVED_ZIP |"
-            echo "| ZIP Size | $ZIP_SIZE MB |"
-            echo "| Build Mode | $BUILD_MODE |"
-            echo "| Build Task | $BUILD_TASK |"
-            echo "| Flavor | $BUILD_FLAVOR |"
-            echo "| Java | $JAVA_VERSION |"
-            echo "| Flutter Project | $IS_FLUTTER |"
-            echo "| Gradle Version | $GRADLE_VERSION |"
-            echo "| Required Gradle | $REQUIRED_GRADLE |"
-            echo "| AGP Version | $AGP_VERSION |"
-            echo "| Kotlin Minimum/Target | $KOTLIN_VERSION |"
-            echo "| Status | ${{ job.status }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "## Native Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Job ID | ${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Zip Size | ${{ steps.validate.outputs.zip_size_mb }} MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Task | ${{ github.event.inputs.build_task }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flavor | ${{ github.event.inputs.build_flavor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Java | ${{ github.event.inputs.java_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY 
+                                                   
