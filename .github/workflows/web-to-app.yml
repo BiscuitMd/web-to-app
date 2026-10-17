@@ -84,7 +84,7 @@ on:
         required: false
         type: string
       icon_url:
-        description: 'URL icon (mode baru, opsional)'
+        description: 'URL icon (mode baru, opsional — bisa raw GitHub atau Release asset)'
         required: false
         type: string
       build_mode:
@@ -95,6 +95,9 @@ on:
         description: 'Job ID (mode baru)'
         required: false
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -113,6 +116,8 @@ jobs:
       - name: Detect Mode & Prepare Files
         id: prep
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
 
@@ -205,10 +210,37 @@ jobs:
           EOF
             echo "✓ Generated $TARGET_DIR/$CONFIG_FILE"
 
-            # Download icon
+            # ═══════════════════════════════════════════════════════
+            # DOWNLOAD ICON (FIX: support Release asset + auth header)
+            # ═══════════════════════════════════════════════════════
             if [ -n "$ICON_URL" ]; then
               echo "Downloading icon from: $ICON_URL"
-              curl -sSL --max-time 30 "$ICON_URL" -o "$TARGET_DIR/$ICON_FILE" || true
+
+              ICON_DOWNLOADED=0
+              for attempt in 1 2 3; do
+                echo "  Attempt $attempt/3..."
+                HTTP_CODE=$(curl -sSL --max-time 60 \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" \
+                  -w "%{http_code}" \
+                  -o "$TARGET_DIR/$ICON_FILE" \
+                  "$ICON_URL" 2>/dev/null || echo "000")
+
+                if [ "$HTTP_CODE" = "200" ] && [ -s "$TARGET_DIR/$ICON_FILE" ]; then
+                  echo "  ✓ Download berhasil (HTTP $HTTP_CODE)"
+                  ICON_DOWNLOADED=1
+                  break
+                else
+                  echo "  ✗ Gagal (HTTP $HTTP_CODE), retry dalam 3s..."
+                  sleep 3
+                fi
+              done
+
+              if [ "$ICON_DOWNLOADED" != "1" ]; then
+                echo "::warning::Gagal download icon setelah 3 percobaan, pakai default"
+              fi
+            else
+              echo "ℹ️  Tidak ada icon_url dari bot, pakai default icon"
             fi
 
             # Kalau icon gagal / ga ada → pakai default 1x1 PNG
@@ -216,7 +248,7 @@ jobs:
               echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" | base64 -d > "$TARGET_DIR/$ICON_FILE"
               echo "✓ Using default icon"
             else
-              echo "✓ Icon downloaded: $(ls -lh $TARGET_DIR/$ICON_FILE | awk '{print $5}')"
+              echo "✓ Icon siap: $(ls -lh $TARGET_DIR/$ICON_FILE | awk '{print $5}')"
             fi
 
             # Override build_type dari build_mode kalau ada
@@ -245,6 +277,7 @@ jobs:
           echo "✓ Final APP_URL: $EFFECTIVE_URL"
 
       - name: Show Config
+        shell: bash
         run: cat "${{ env.TARGET }}/${{ env.CONFIG_FILE }}"
 
       - name: Setup Java 17
@@ -533,7 +566,6 @@ jobs:
           TARGET="${{ env.TARGET }}"
           CONFIG_FILE="${{ env.CONFIG_FILE }}"
 
-          # Coba baca dari config.json dulu (mode URL & mode dir yang punya config)
           APP_NAME_FINAL=""
           APP_URL_FINAL=""
 
@@ -542,14 +574,12 @@ jobs:
             APP_URL_FINAL=$(python3 -c "import json; print(json.load(open('$TARGET/$CONFIG_FILE')).get('app_url',''))" 2>/dev/null || echo "")
           fi
 
-          # Fallback ke input workflow kalau config kosong
           [ -z "$APP_NAME_FINAL" ] && APP_NAME_FINAL="${{ env.APP_NAME_FINAL }}"
           [ -z "$APP_URL_FINAL" ] && APP_URL_FINAL="${{ env.APP_URL_FINAL }}"
 
           echo "APP_NAME_FINAL=$APP_NAME_FINAL"
           echo "APP_URL_FINAL=$APP_URL_FINAL"
 
-          # Escape XML entities sederhana
           APP_NAME_XML=$(printf '%s' "$APP_NAME_FINAL" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
           APP_URL_XML=$(printf '%s' "$APP_URL_FINAL" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
 
