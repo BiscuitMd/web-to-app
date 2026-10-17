@@ -1,21 +1,37 @@
 name: Deploy Website
+
 on:
   workflow_dispatch:
     inputs:
+      # ═══ DARI BOT (HYBRID MODE — ZIP via GitHub Release) ═══
+      base_zip_url:
+        description: URL ZIP di GitHub Release (dari bot)
+        required: false
+        default: ""
+        type: string
+      # ═══ DARI BOT (LAMA — folder di repo) ═══
       server:
         description: Logical build slot
-        required: true
+        required: false
+        default: "1"
         type: choice
         options: ["1","2","3","4","5"]
       provider:
         description: Hosting provider
-        required: true
+        required: false
+        default: "vercel"
         type: choice
         options: ["vercel","netlify"]
       project_path:
-        description: Website directory inside repository
-        required: true
-        default: "public"
+        description: Folder di repo yang berisi ZIP HTML (mode lama)
+        required: false
+        default: ""
+        type: string
+      base_zip_name:
+        description: Nama file ZIP di dalam project_path (mode lama)
+        required: false
+        default: ""
+        type: string
       site_name:
         description: Project/site name
         required: true
@@ -29,42 +45,200 @@ on:
       user_name:
         required: false
         type: string
+
 permissions:
   contents: read
+
 concurrency:
   group: deploy-${{ inputs.server }}
   cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      # ═══════════════════════════════════════════════════════════
+      # PREPARE: Download ZIP (2 mode) → Extract → Validasi HTML
+      # ═══════════════════════════════════════════════════════════
+      - name: Prepare HTML Directory
+        id: prep
+        shell: bash
+        env:
+          BASE_ZIP_URL: ${{ inputs.base_zip_url }}
+          SRC: ${{ inputs.project_path }}
+          ZIP_NAME: ${{ inputs.base_zip_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          WORKDIR="deploy-site"
+          ZIP_LOCAL="/tmp/site-input.zip"
+
+          echo "::group::Prepare HTML Directory"
+          echo "base_zip_url: ${BASE_ZIP_URL:-<kosong>}"
+          echo "project_path: ${SRC:-<kosong>}"
+          echo "base_zip_name: ${ZIP_NAME:-<kosong>}"
+
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR"
+
+          # ═══════════════════════════════════════════════════════
+          # MODE 1: base_zip_url dari bot (PRIORITAS UTAMA)
+          # ═══════════════════════════════════════════════════════
+          if [ -n "$BASE_ZIP_URL" ]; then
+            echo "✓ Mode: BOT-URL"
+            echo "   Download: $BASE_ZIP_URL"
+            curl -L -f --retry 3 --retry-delay 5 \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "$ZIP_LOCAL" \
+              "$BASE_ZIP_URL"
+
+            echo "   Extracting..."
+            unzip -q -o "$ZIP_LOCAL" -d "$WORKDIR"
+            rm -f "$ZIP_LOCAL"
+            echo "   ✓ Extract selesai"
+
+          # ═══════════════════════════════════════════════════════
+          # MODE 2: project_path folder di repo (mode lama)
+          # ═══════════════════════════════════════════════════════
+          elif [ -n "$SRC" ] && [ -d "$SRC" ]; then
+            echo "✓ Mode: FOLDER ($SRC)"
+
+            # Cari ZIP: pakai nama dari input, atau yang pertama ditemukan
+            ZIP_FILE=""
+            if [ -n "$ZIP_NAME" ] && [ -f "$SRC/$ZIP_NAME" ]; then
+              ZIP_FILE="$SRC/$ZIP_NAME"
+            else
+              ZIP_FILE=$(find "$SRC" -maxdepth 2 -type f -iname '*.zip' | head -n1 || true)
+            fi
+
+            if [ -n "$ZIP_FILE" ] && [ -f "$ZIP_FILE" ]; then
+              echo "   Extract ZIP: $ZIP_FILE"
+              unzip -q -o "$ZIP_FILE" -d "$WORKDIR"
+            else
+              echo "   ⚠️  Tidak ada ZIP, cek file HTML langsung"
+              if find "$SRC" -maxdepth 1 -type f \( -iname '*.html' -o -iname '*.htm' \) | head -n1 | grep -q .; then
+                cp -r "$SRC"/. "$WORKDIR"/
+              else
+                echo "::error::Tidak ada ZIP dan tidak ada HTML di: $SRC"
+                find "$SRC" -maxdepth 3 -type f | head -n 30
+                exit 1
+              fi
+            fi
+
+          else
+            echo "::error::Tidak ada base_zip_url dan project_path tidak ditemukan."
+            echo "base_zip_url='$BASE_ZIP_URL'"
+            echo "project_path='$SRC'"
+            exit 1
+          fi
+
+          # ═══ FLATTEN: Kalau cuma 1 folder di dalam, naikkan ke root ═══
+          SUBDIRS=$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            INNER=$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d)
+            mv "$INNER"/* "$WORKDIR"/ 2>/dev/null || true
+            rmdir "$INNER" 2>/dev/null || true
+            echo "   ✓ Flatten subfolder"
+          fi
+
+          # ═══ VALIDASI: HARUS HTML STATIS ═══
+          INDEX_FILE=""
+          if [ -f "$WORKDIR/index.html" ]; then
+            INDEX_FILE="$WORKDIR/index.html"
+          elif [ -f "$WORKDIR/index.htm" ]; then
+            INDEX_FILE="$WORKDIR/index.htm"
+          else
+            FOUND_HTML=$(find "$WORKDIR" -maxdepth 2 -type f \( -iname '*.html' -o -iname '*.htm' \) | head -n1 || true)
+            if [ -n "$FOUND_HTML" ]; then
+              SUB_DIR=$(dirname "$FOUND_HTML")
+              echo "   ⚠️  index.html tidak di root, pakai folder: $SUB_DIR"
+              WORKDIR="$SUB_DIR"
+              INDEX_FILE="$FOUND_HTML"
+            fi
+          fi
+
+          if [ -z "$INDEX_FILE" ] || [ ! -f "$INDEX_FILE" ]; then
+            echo "::error::Tidak ada file HTML (.html/.htm) di project."
+            echo "Isi ZIP:"
+            find "$WORKDIR" -type f | head -n 40
+            exit 1
+          fi
+          echo "✓ Entry HTML: $INDEX_FILE"
+
+          # ═══ Validasi bukan project Node.js ═══
+          HTML_COUNT=$(find "$WORKDIR" -type f \( -iname '*.html' -o -iname '*.htm' \) | wc -l)
+          PKG_COUNT=$(find "$WORKDIR" -type f -iname 'package.json' | wc -l)
+          echo "✓ HTML files: $HTML_COUNT"
+          echo "✓ package.json: $PKG_COUNT"
+
+          if [ "$PKG_COUNT" -gt 0 ] && [ "$HTML_COUNT" -eq 0 ]; then
+            echo "::error::Ini project Node.js (ada package.json tanpa HTML). Deploy hanya untuk HTML statis."
+            exit 1
+          fi
+
+          echo "✓ Isi $WORKDIR:"
+          ls -la "$WORKDIR" | head -n 30
+
+          echo "deploy_dir=$WORKDIR" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
       - name: Install Vercel CLI
         if: inputs.provider == 'vercel'
         run: npm install --global vercel
+
       - name: Deploy to Vercel
         if: inputs.provider == 'vercel'
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           SITE_NAME: ${{ inputs.site_name }}
-          PROJECT_PATH: ${{ inputs.project_path }}
         run: |
-          test -n "$VERCEL_TOKEN"
-          cd "$PROJECT_PATH"
+          set -Eeuo pipefail
+          test -n "$VERCEL_TOKEN" || { echo "::error::VERCEL_TOKEN kosong"; exit 1; }
+          cd "${{ steps.prep.outputs.deploy_dir }}"
           vercel deploy --yes --prod --name "$SITE_NAME" --token "$VERCEL_TOKEN"
+
       - name: Install Netlify CLI
         if: inputs.provider == 'netlify'
         run: npm install --global netlify-cli
+
       - name: Deploy to Netlify
         if: inputs.provider == 'netlify'
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
-          SITE_NAME: ${{ inputs.site_name }}
-          PROJECT_PATH: ${{ inputs.project_path }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
         run: |
-          test -n "$NETLIFY_AUTH_TOKEN"
-          netlify deploy --dir "$PROJECT_PATH" --prod --site "${{ secrets.NETLIFY_SITE_ID }}" --auth "$NETLIFY_AUTH_TOKEN"
+          set -Eeuo pipefail
+          test -n "$NETLIFY_AUTH_TOKEN" || { echo "::error::NETLIFY_AUTH_TOKEN kosong"; exit 1; }
+          cd "${{ steps.prep.outputs.deploy_dir }}"
+          if [ -n "$NETLIFY_SITE_ID" ]; then
+            netlify deploy --dir . --prod --site "$NETLIFY_SITE_ID" --auth "$NETLIFY_AUTH_TOKEN"
+          else
+            netlify deploy --dir . --prod --auth "$NETLIFY_AUTH_TOKEN"
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Deploy Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Provider | ${{ inputs.provider }} |"
+            echo "| Site Name | ${{ inputs.site_name }} |"
+            echo "| Server | ${{ inputs.server }} |"
+            echo "| Source | ${{ inputs.base_zip_url != '' && 'GitHub Release' || 'Repo Folder' }} |"
+            echo "| User ID | ${{ inputs.user_id }} |"
+            echo "| Status | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
