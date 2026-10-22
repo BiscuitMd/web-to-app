@@ -73,6 +73,11 @@ on:
         required: false
         default: 'auto'
         type: string
+      force_flutter_version:
+        description: 'Paksa versi Flutter (kosongkan untuk auto)'
+        required: false
+        default: ''
+        type: string
       split_per_abi:
         description: 'Split APK per ABI (lebih kecil per file)'
         required: false
@@ -266,6 +271,24 @@ jobs:
           echo "::endgroup::"
           echo "::endgroup::"
 
+      # ═══════════════════════════════════════════════════════════
+      # ⚠️ STEP BARU: AUTO-GENERATE ANDROID FOLDER (Fitur AppGenius)
+      # ═══════════════════════════════════════════════════════════
+      - name: Auto-Generate Android Platform (AppGenius)
+        working-directory: ${{ steps.detect_root.outputs.root }}
+        shell: bash
+        run: |
+          echo "::group::AppGenius - Check Android Folder"
+          if [ ! -d "android" ]; then
+            echo "⚠️ Folder android/ tidak ditemukan (Kemungkinan dari AppGenius)."
+            echo "Membuat folder platform Android secara otomatis..."
+            flutter create . --platforms=android --project-name=builder
+            echo "✓ Berhasil membuat folder android."
+          else
+            echo "✓ Folder android/ sudah ada. Melewati auto-generate."
+          fi
+          echo "::endgroup::"
+
       - name: Detect Dart SDK Requirement and Compatible Flutter
         id: detect_sdk
         working-directory: ${{ steps.detect_root.outputs.root }}
@@ -356,9 +379,13 @@ jobs:
         run: |
           echo "::group::Resolve Flutter Version"
           INPUT_VER="${{ github.event.inputs.flutter_version }}"
+          FORCE_VER="${{ github.event.inputs.force_flutter_version }}"
           AUTO_VER="${{ steps.detect_sdk.outputs.flutter_req }}"
 
-          if [ -z "$INPUT_VER" ] || [ "$INPUT_VER" = "auto" ]; then
+          if [ -n "$FORCE_VER" ]; then
+            FINAL_VER="$FORCE_VER"
+            echo "✓ Force version: $FINAL_VER"
+          elif [ -z "$INPUT_VER" ] || [ "$INPUT_VER" = "auto" ]; then
             FINAL_VER="$AUTO_VER"
           else
             FINAL_VER="$INPUT_VER"
