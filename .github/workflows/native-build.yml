@@ -1,0 +1,535 @@
+name: Native Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ────── BARU: Hybrid mode (ZIP besar via GitHub Release) ──────
+      base_zip_url:
+        description: 'URL ZIP di GitHub Release (dari bot hybrid)'
+        required: false
+        default: ''
+        type: string
+      # ────── Input dari bot (github.js) ──────
+      base_zip_path:
+        description: 'Path ZIP di repo (dari bot — Contents API, <1MB)'
+        required: false
+        default: ''
+        type: string
+      server:
+        description: 'Server metadata dari bot'
+        required: false
+        default: ''
+        type: string
+      build_mode:
+        description: 'debug/release dari bot'
+        required: false
+        default: ''
+        type: string
+      project_path:
+        description: 'Path folder project (opsional)'
+        required: false
+        default: ''
+        type: string
+      user_id:
+        description: 'Telegram user ID (metadata)'
+        required: false
+        default: ''
+        type: string
+      username:
+        description: 'Telegram username (metadata)'
+        required: false
+        default: ''
+        type: string
+      user_name:
+        description: 'Nama user Telegram (metadata)'
+        required: false
+        default: ''
+        type: string
+      # ────── Input manual (UI) ──────
+      target_dir:
+        description: 'Target directory (kalau manual)'
+        required: false
+        default: ''
+        type: string
+      zip_file:
+        description: 'Nama file zip (kalau manual)'
+        required: false
+        default: ''
+        type: string
+      build_task:
+        description: 'Gradle task'
+        required: false
+        default: 'assembleRelease'
+        type: choice
+        options:
+          - assembleRelease
+          - assembleDebug
+          - bundleRelease
+          - bundleDebug
+      build_flavor:
+        description: 'Product flavor (kosongkan kalau tidak ada)'
+        required: false
+        default: ''
+        type: string
+      java_version:
+        description: 'Versi Java'
+        required: false
+        default: '17'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-build-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ════════════════════════════════════════════════════════════
+      # RESOLVE SOURCE
+      # Prioritas:
+      #   1. base_zip_url    (BARU — hybrid, GitHub Release, sampai 2 GB)
+      #   2. base_zip_path   (lama — Contents API, <1 MB)
+      #   3. project_path    (folder / zip)
+      #   4. target_dir/zip_file
+      #   5. root repo
+      #   6. build-inputs/native (fallback lama)
+      # ════════════════════════════════════════════════════════════
+      - name: Resolve Project Source
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_BASE_ZIP_URL: ${{ inputs.base_zip_url }}
+          IN_BASE_ZIP: ${{ inputs.base_zip_path }}
+          IN_PROJECT_PATH: ${{ inputs.project_path }}
+          IN_TARGET_DIR: ${{ inputs.target_dir }}
+          IN_ZIP_FILE: ${{ inputs.zip_file }}
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Resolve Project Source"
+
+          BASE_ZIP_URL="${IN_BASE_ZIP_URL:-}"
+          BASE_ZIP="${IN_BASE_ZIP:-}"
+          PROJECT_PATH="${IN_PROJECT_PATH:-}"
+          TARGET_DIR="${IN_TARGET_DIR:-}"
+          ZIP_FILE="${IN_ZIP_FILE:-}"
+          WORK_DIR="$RUNNER_TEMP/native-project"
+
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+
+          # ── 0. BARU: base_zip_url dari GitHub Release (hybrid) ──
+          if [ -n "$BASE_ZIP_URL" ]; then
+            echo "✓ Mode: BOT-URL (hybrid — download dari Release)"
+            echo "   URL: $BASE_ZIP_URL"
+
+            curl -L -f --retry 3 --retry-delay 5 \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "$WORK_DIR/input.zip" \
+              "$BASE_ZIP_URL"
+
+            unzip -o "$WORK_DIR/input.zip" -d "$WORK_DIR" >/dev/null
+            rm -f "$WORK_DIR/input.zip"
+            echo "   ✓ Extract selesai"
+
+            # Flatten kalau cuma 1 subfolder
+            SUBDIRS=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
+            FILES=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type f | wc -l)
+            if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+              INNER=$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d)
+              mv "$INNER"/* "$WORK_DIR"/ 2>/dev/null || true
+              rmdir "$INNER" 2>/dev/null || true
+              echo "   ✓ Flatten subfolder"
+            fi
+
+            echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+            echo "mode=extract" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 1. base_zip_path dari bot (lama) ──
+          if [ -n "$BASE_ZIP" ] && [ -f "$BASE_ZIP" ]; then
+            echo "✓ Mode: BOT-ZIP ($BASE_ZIP)"
+            unzip -o "$BASE_ZIP" -d "$WORK_DIR" >/dev/null
+            echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+            echo "mode=extract" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 2. project_path = folder dengan gradle ──
+          if [ -n "$PROJECT_PATH" ] && [ -d "$PROJECT_PATH" ]; then
+            if [ -f "$PROJECT_PATH/gradlew" ] || \
+               [ -f "$PROJECT_PATH/settings.gradle" ] || \
+               [ -f "$PROJECT_PATH/settings.gradle.kts" ] || \
+               [ -f "$PROJECT_PATH/build.gradle" ] || \
+               [ -f "$PROJECT_PATH/build.gradle.kts" ]; then
+              echo "✓ Mode: DIRECT ($PROJECT_PATH)"
+              echo "project_root=$(realpath "$PROJECT_PATH")" >> "$GITHUB_OUTPUT"
+              echo "mode=direct" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"; exit 0
+            fi
+          fi
+
+          # ── 3. project_path = ZIP ──
+          if [ -n "$PROJECT_PATH" ] && [ -f "$PROJECT_PATH" ] && [[ "$PROJECT_PATH" == *.zip ]]; then
+            echo "✓ Mode: ZIP ($PROJECT_PATH)"
+            unzip -o "$PROJECT_PATH" -d "$WORK_DIR" >/dev/null
+            echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+            echo "mode=extract" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 4. target_dir/zip_file (manual UI) ──
+          if [ -n "$TARGET_DIR" ] && [ -n "$ZIP_FILE" ] && [ -f "$TARGET_DIR/$ZIP_FILE" ]; then
+            echo "✓ Mode: MANUAL-ZIP ($TARGET_DIR/$ZIP_FILE)"
+            unzip -o "$TARGET_DIR/$ZIP_FILE" -d "$WORK_DIR" >/dev/null
+            echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+            echo "mode=extract" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 5. fallback: root repo punya gradle ──
+          if [ -f "gradlew" ] || [ -f "settings.gradle" ] || \
+             [ -f "settings.gradle.kts" ] || [ -f "build.gradle" ] || \
+             [ -f "build.gradle.kts" ]; then
+            echo "✓ Mode: DIRECT-ROOT"
+            echo "project_root=$(realpath .)" >> "$GITHUB_OUTPUT"
+            echo "mode=direct" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"; exit 0
+          fi
+
+          # ── 6. fallback: cari ZIP terbaru di build-inputs/native ──
+          if [ -d "build-inputs/native" ]; then
+            LATEST=$(find build-inputs/native -type f -iname '*.zip' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+            if [ -n "$LATEST" ] && [ -f "$LATEST" ]; then
+              echo "✓ Mode: FALLBACK-LATEST ($LATEST)"
+              unzip -o "$LATEST" -d "$WORK_DIR" >/dev/null
+              echo "extract_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+              echo "mode=extract" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"; exit 0
+            fi
+          fi
+
+          echo "::error::Source project tidak ditemukan."
+          echo "base_zip_url='$BASE_ZIP_URL'"
+          echo "base_zip_path='$BASE_ZIP'"
+          echo "project_path='$PROJECT_PATH'"
+          echo "target_dir='$TARGET_DIR' zip_file='$ZIP_FILE'"
+          ls -la
+          [ -d build-inputs ] && find build-inputs -maxdepth 3 -type f | head -n 30
+          echo "::endgroup::"; exit 1
+
+      # ════════════════════════════════════════════════════════════
+      # LOCATE GRADLE ROOT
+      # ════════════════════════════════════════════════════════════
+      - name: Locate Gradle Root
+        id: detect
+        shell: bash
+        env:
+          RESOLVE_MODE: ${{ steps.resolve.outputs.mode }}
+          RESOLVE_ROOT: ${{ steps.resolve.outputs.project_root }}
+          EXTRACT_DIR: ${{ steps.resolve.outputs.extract_dir }}
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Locate Gradle Root"
+
+          if [ "$RESOLVE_MODE" = "direct" ]; then
+            SEARCH_BASE="$RESOLVE_ROOT"
+          else
+            SEARCH_BASE="$EXTRACT_DIR"
+          fi
+
+          ROOT=""
+
+          if [ -f "$SEARCH_BASE/settings.gradle" ] || [ -f "$SEARCH_BASE/settings.gradle.kts" ] || \
+             [ -f "$SEARCH_BASE/build.gradle" ] || [ -f "$SEARCH_BASE/build.gradle.kts" ] || \
+             [ -f "$SEARCH_BASE/gradlew" ]; then
+            ROOT="$SEARCH_BASE"
+          else
+            FOUND=$(find "$SEARCH_BASE" -maxdepth 6 \( \
+              -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "gradlew" \
+              \) -type f -not -path "*/node_modules/*" -not -path "*/build/*" | head -n 1)
+
+            [ -n "$FOUND" ] || {
+              echo "::error::Gradle project tidak ditemukan di: $SEARCH_BASE"
+              find "$SEARCH_BASE" -maxdepth 4 -type f | head -n 80
+              exit 1
+            }
+            ROOT="$(dirname "$FOUND")"
+          fi
+
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "✓ Gradle root: $ROOT"
+          ls -la "$ROOT" | head -n 40
+          echo "::endgroup::"
+
+      # ════════════════════════════════════════════════════════════
+      # SETUP ENV
+      # ════════════════════════════════════════════════════════════
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version || '17' }}
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Setup Android SDK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Setup Android SDK"
+          SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          cd "$SDK_ROOT"
+          curl -fLsS "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d cmdline-tools-tmp
+          rm -rf cmdline-tools/latest
+          mv cmdline-tools-tmp/cmdline-tools cmdline-tools/latest
+          rm -rf cmdline-tools-tmp cmdline-tools.zip
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "::endgroup::"
+
+      - name: Accept Licenses & Install SDK Packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Install SDK Packages"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" "build-tools;34.0.0" \
+            "platforms;android-35" "build-tools;35.0.0" \
+            "platforms;android-33" "build-tools;33.0.1" \
+            "platforms;android-32" "build-tools;32.0.0" || true
+          echo "::endgroup::"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Prepare Gradle Wrapper
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Prepare Gradle Wrapper"
+          mkdir -p gradle/wrapper
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ] || [ ! -f "gradlew" ]; then
+            gradle wrapper --gradle-version 8.2 --distribution-type bin
+          fi
+          chmod +x gradlew
+          echo "::endgroup::"
+
+      - name: Auto-Generate Missing Icons
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Auto-Generate Icons"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+          MANIFEST=$(find . -name "AndroidManifest.xml" -path "*/main/*" -type f | head -n 1)
+          [ -n "$MANIFEST" ] || { echo "::warning::Manifest tidak ada, skip"; echo "::endgroup::"; exit 0; }
+          RES_DIR="$(dirname "$MANIFEST")/res"
+          [ -d "$RES_DIR" ] || { echo "::warning::res/ tidak ada, skip"; echo "::endgroup::"; exit 0; }
+          ICONS=$(grep -oE '@mipmap/[a-zA-Z0-9_]+' "$MANIFEST" | sed 's|@mipmap/||' | sort -u || true)
+          for ICON in $ICONS; do
+            for ITEM in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              DENSITY="${ITEM%%:*}"; SIZE="${ITEM##*:}"
+              DIR="$RES_DIR/mipmap-$DENSITY"; FILE="$DIR/$ICON.png"
+              [ -f "$FILE" ] && continue
+              mkdir -p "$DIR"
+              INITIAL=$(printf '%s' "$ICON" | head -c 1 | tr '[:lower:]' '[:upper:]')
+              case "$ICON" in
+                *instagram*) COLOR="#E1306C" ;;
+                *youtube*)   COLOR="#FF0000" ;;
+                *whatsapp*)  COLOR="#25D366" ;;
+                *telegram*)  COLOR="#0088CC" ;;
+                *)           COLOR="#3B82F6" ;;
+              esac
+              convert -size "${SIZE}x${SIZE}" "xc:$COLOR" -gravity center \
+                -pointsize "$((SIZE/2))" -fill white -font DejaVu-Sans-Bold \
+                -annotate +0+0 "$INITIAL" "$FILE" 2>/dev/null || true
+            done
+          done
+          echo "::endgroup::"
+
+      - name: Fix local.properties
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
+
+      - name: Build with Gradle
+        id: gradle_build
+        working-directory: ${{ steps.detect.outputs.root }}
+        shell: bash
+        env:
+          IN_BUILD_MODE: ${{ inputs.build_mode }}
+          IN_BUILD_TASK: ${{ inputs.build_task }}
+          IN_BUILD_FLAVOR: ${{ inputs.build_flavor }}
+        run: |
+          set -uo pipefail
+          echo "::group::Gradle Build"
+
+          MODE="$(printf '%s' "${IN_BUILD_MODE:-}" | tr '[:upper:]' '[:lower:]')"
+          TASK="${IN_BUILD_TASK:-assembleRelease}"
+          FLAVOR="${IN_BUILD_FLAVOR:-}"
+
+          case "$MODE" in
+            debug|assembledebug|apk-debug) TASK="assembleDebug" ;;
+            release|assemblerelease|apk|apk-release) TASK="assembleRelease" ;;
+            bundle|bundlerelease|aab) TASK="bundleRelease" ;;
+            bundledebug) TASK="bundleDebug" ;;
+          esac
+
+          case "$TASK" in
+            assembleRelease|assembleDebug|bundleRelease|bundleDebug) ;;
+            *) echo "::error::Task tidak diizinkan: $TASK"; exit 1 ;;
+          esac
+
+          if [ -n "$FLAVOR" ]; then
+            CAP="$(printf '%s' "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+            FINAL_TASK="${TASK}${CAP}"
+          else
+            FINAL_TASK="$TASK"
+          fi
+
+          echo "Mode: $MODE"
+          echo "Task: $FINAL_TASK"
+          ./gradlew "$FINAL_TASK" --no-daemon --stacktrace 2>&1 | tee /tmp/gradle.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "Exit code: $EXIT_CODE"
+          echo "::endgroup::"
+          exit $EXIT_CODE
+
+      - name: Show Gradle Error
+        if: failure()
+        shell: bash
+        run: |
+          echo "::group::Gradle Error (Last 120 lines)"
+          [ -f /tmp/gradle.log ] && tail -n 120 /tmp/gradle.log || echo "Log tidak ada"
+          echo "::endgroup::"
+
+      - name: Locate APK/AAB
+        id: locate
+        if: success()
+        shell: bash
+        env:
+          ROOT: ${{ steps.detect.outputs.root }}
+        run: |
+          set -Eeuo pipefail
+          APKS=$(find "$ROOT" -type f -name "*.apk" -not -path "*/.gradle/*" -not -path "*/.git/*" 2>/dev/null || true)
+          AABS=$(find "$ROOT" -type f -name "*.aab" -not -path "*/.gradle/*" -not -path "*/.git/*" 2>/dev/null || true)
+          if [ -z "$APKS" ] && [ -z "$AABS" ]; then
+            echo "::error::Tidak ada APK/AAB dihasilkan."
+            find "$ROOT" -type d \( -name build -o -name outputs \) 2>/dev/null | head -n 20
+            exit 1
+          fi
+          {
+            echo "apks<<EOF"; echo "$APKS"; echo "EOF"
+            echo "aabs<<EOF"; echo "$AABS"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate Build Info
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "=== NATIVE BUILD INFO ==="
+            echo "Job ID: $GITHUB_RUN_ID"
+            echo "Server: ${{ inputs.server }}"
+            echo "Build Mode: ${{ inputs.build_mode }}"
+            echo "Base ZIP URL: ${{ inputs.base_zip_url }}"
+            echo "Base ZIP Path: ${{ inputs.base_zip_path }}"
+            echo "User ID: ${{ inputs.user_id }}"
+            echo "Username: ${{ inputs.username }}"
+            echo "Resolve Mode: ${{ steps.resolve.outputs.mode }}"
+            echo "Gradle Root: ${{ steps.detect.outputs.root }}"
+            echo "Commit: $GITHUB_SHA"
+            echo "Finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > BUILD_INFO.txt
+          cat BUILD_INFO.txt
+
+      - name: Upload APK
+        if: success() && steps.locate.outputs.apks != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: ${{ steps.locate.outputs.apks }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload App Bundle
+        if: success() && steps.locate.outputs.aabs != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbundle-release
+          path: ${{ steps.locate.outputs.aabs }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Build Info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: BUILD_INFO.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload Gradle Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log
+          path: /tmp/gradle.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Native Build Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Job ID | $GITHUB_RUN_ID |"
+            echo "| Server | ${{ inputs.server }} |"
+            echo "| Mode | ${{ inputs.build_mode }} |"
+            echo "| Source | ${{ inputs.base_zip_url != '' && 'GitHub Release' || inputs.base_zip_path != '' && 'Repo Contents' || inputs.project_path != '' && 'Project Path' || 'Auto' }} |"
+            echo "| Base ZIP URL | ${{ inputs.base_zip_url }} |"
+            echo "| Base ZIP Path | ${{ inputs.base_zip_path }} |"
+            echo "| Resolve | ${{ steps.resolve.outputs.mode }} |"
+            echo "| User | ${{ inputs.user_id }} |"
+            echo "| Status | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
